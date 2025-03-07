@@ -266,7 +266,7 @@ impl Transport for SseTransport {
     async fn start(&self) -> Result<Self::Handle, Error> {
         // Set environment variables
         for (key, value) in &self.env {
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value) };
         }
 
         // Create a channel for outgoing TransportMessages

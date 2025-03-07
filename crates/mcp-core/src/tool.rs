@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::handler::ToolHandler;
+
 /// A tool that can be used by a model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +29,10 @@ impl Tool {
             description: description.into(),
             input_schema,
         }
+    }
+
+    pub fn from_handler<H: ToolHandler + ?Sized>(handler: &H) -> Self {
+        Self::new(handler.name(), handler.description(), handler.schema())
     }
 }
 

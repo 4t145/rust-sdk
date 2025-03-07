@@ -10,3 +10,4 @@ pub use resource::{Resource, ResourceContents};
 pub mod protocol;
 pub use handler::{ToolError, ToolResult};
 pub mod prompt;
+pub mod toolset;

@@ -7,6 +7,7 @@ use std::{
 type PromptFuture = Pin<Box<dyn Future<Output = Result<String, PromptError>> + Send + 'static>>;
 
 use mcp_core::{
+    ResourceContents,
     content::Content,
     handler::{PromptError, ResourceError, ToolError},
     prompt::{Prompt, PromptMessage, PromptMessageRole},
@@ -16,7 +17,6 @@ use mcp_core::{
         PromptsCapability, ReadResourceResult, ResourcesCapability, ServerCapabilities,
         ToolsCapability,
     },
-    ResourceContents,
 };
 use serde_json::Value;
 use tower_service::Service;
@@ -91,14 +91,17 @@ pub trait Router: Send + Sync + 'static {
         &self,
         tool_name: &str,
         arguments: Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Content>, ToolError>> + Send + 'static>>;
+    ) -> impl Future<Output = Result<Vec<Content>, ToolError>> + Send;
     fn list_resources(&self) -> Vec<mcp_core::resource::Resource>;
     fn read_resource(
         &self,
         uri: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ResourceError>> + Send + 'static>>;
+    ) -> impl Future<Output = Result<String, ResourceError>> + Send;
     fn list_prompts(&self) -> Vec<Prompt>;
-    fn get_prompt(&self, prompt_name: &str) -> PromptFuture;
+    fn get_prompt(
+        &self,
+        prompt_name: &str,
+    ) -> impl Future<Output = Result<String, PromptError>> + Send;
 
     // Helper method to create base response
     fn create_response(&self, id: Option<u64>) -> JsonRpcResponse {

@@ -1,9 +1,11 @@
-use std::future::Future;
+use std::{future::Future, ops::Deref, pin::Pin};
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::Content;
 
 #[non_exhaustive]
 #[derive(Error, Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -16,6 +18,12 @@ pub enum ToolError {
     SchemaError(String),
     #[error("Tool not found: {0}")]
     NotFound(String),
+}
+
+impl ToolError {
+    pub fn execution<E: ToString>(e: E) -> Self {
+        Self::ExecutionError(e.to_string())
+    }
 }
 
 pub type ToolResult<T> = std::result::Result<T, ToolError>;
@@ -50,7 +58,85 @@ pub trait ToolHandler: Send + Sync + 'static {
     fn schema(&self) -> Value;
 
     /// Execute the tool with the given parameters
-    fn call(&self, params: Value) -> impl Future<Output = ToolResult<Value>> + Send;
+    fn call(
+        &self,
+        params: Value,
+    ) -> Pin<Box<dyn Future<Output = ToolResult<Vec<Content>>> + Send + '_>>;
+}
+
+/// Trait for implementing MCP tools with specified types
+pub trait TypedToolHandler: Send + Sync + 'static {
+    #[cfg(feature = "default_json_schema")]
+    type Params: DeserializeOwned + JsonSchema;
+
+    #[cfg(not(feature = "default_json_schema"))]
+    type Params: DeserializeOwned;
+    /// The name of the tool
+    fn name(&self) -> &'static str;
+
+    /// A description of what the tool does
+    fn description(&self) -> &'static str;
+
+    /// JSON schema describing the tool's parameters
+    #[cfg(feature = "default_json_schema")]
+    fn schema(&self) -> Value {
+        serde_json::to_value(schemars::schema_for!(Self::Params))
+            .expect("json schema should always be a valid json object")
+    }
+
+    #[cfg(not(feature = "default_json_schema"))]
+    fn schema(&self) -> Value;
+
+    /// Execute the tool with the given parameters
+    fn call(&self, params: Self::Params) -> impl Future<Output = ToolResult<Vec<Content>>> + Send;
+}
+#[diagnostic::do_not_recommend]
+impl<H: TypedToolHandler> ToolHandler for H {
+    fn name(&self) -> &'static str {
+        TypedToolHandler::name(self)
+    }
+
+    fn description(&self) -> &'static str {
+        TypedToolHandler::description(self)
+    }
+
+    fn schema(&self) -> Value {
+        TypedToolHandler::schema(self)
+    }
+
+    fn call(
+        &self,
+        params: Value,
+    ) -> Pin<Box<dyn Future<Output = ToolResult<Vec<Content>>> + Send + '_>> {
+        Box::pin(async {
+            let input = serde_json::from_value(params)
+                .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
+            let result = TypedToolHandler::call(self, input)
+                .await?
+                .into_iter()
+                .collect();
+            Ok(result)
+        })
+    }
+}
+
+pub struct DynToolHandler(Box<dyn ToolHandler>);
+
+impl Deref for DynToolHandler {
+    type Target = dyn ToolHandler;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl DynToolHandler {
+    /// Convert from a [`TypedToolHandler`]
+    pub fn new<H: ToolHandler>(handler: H) -> Self {
+        Self(Box::new(handler))
+    }
+    pub fn new_boxed(handler: Box<dyn ToolHandler>) -> Self {
+        Self(handler)
+    }
 }
 
 /// Trait for implementing MCP resources
