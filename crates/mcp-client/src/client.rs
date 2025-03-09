@@ -1,11 +1,16 @@
 use mcp_core::protocol::{
     CallToolResult, GetPromptResult, Implementation, InitializeResult, JsonRpcError,
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ListPromptsResult,
-    ListResourcesResult, ListToolsResult, ReadResourceResult, ServerCapabilities, METHOD_NOT_FOUND,
+    ListResourcesResult, ListToolsResult, METHOD_NOT_FOUND, ReadResourceResult, ServerCapabilities,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{future::Future, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    future::Future,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tower::{Service, ServiceExt}; // for Service::ready()
@@ -55,7 +60,7 @@ impl From<BoxError> for Error {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ClientInfo {
     pub name: String,
     pub version: String,
@@ -87,17 +92,158 @@ pub trait McpClientTrait: Send + Sync {
         next_cursor: Option<String>,
     ) -> impl Future<Output = Result<ListResourcesResult, Error>> + Send;
 
-    fn read_resource(&self, uri: &str) -> impl Future<Output = Result<ReadResourceResult, Error>> + Send;
+    fn read_resource(
+        &self,
+        uri: &str,
+    ) -> impl Future<Output = Result<ReadResourceResult, Error>> + Send;
 
-    fn list_tools(&self, next_cursor: Option<String>) -> impl Future<Output = Result<ListToolsResult, Error>> + Send;
+    fn list_tools(
+        &self,
+        next_cursor: Option<String>,
+    ) -> impl Future<Output = Result<ListToolsResult, Error>> + Send;
 
-    fn call_tool(&self, name: &str, arguments: Value) -> impl Future<Output = Result<CallToolResult, Error>> + Send;
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> impl Future<Output = Result<CallToolResult, Error>> + Send;
 
-    fn list_prompts(&self, next_cursor: Option<String>) -> impl Future<Output = Result<ListPromptsResult, Error>> + Send;
+    fn list_prompts(
+        &self,
+        next_cursor: Option<String>,
+    ) -> impl Future<Output = Result<ListPromptsResult, Error>> + Send;
 
-    fn get_prompt(&self, name: &str, arguments: Value) -> impl Future<Output = Result<GetPromptResult, Error>> + Send;
+    fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> impl Future<Output = Result<GetPromptResult, Error>> + Send;
 }
 
+pub trait DynMcpClientTrait: Send + Sync + 'static {
+    fn initialize(
+        &mut self,
+        info: ClientInfo,
+        capabilities: ClientCapabilities,
+    ) -> Pin<Box<dyn Future<Output = Result<InitializeResult, Error>> + Send + '_>>;
+    fn list_resources(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ListResourcesResult, Error>> + Send + '_>>;
+    fn read_resource(
+        &self,
+        uri: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ReadResourceResult, Error>> + Send + '_>>;
+    fn list_tools(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ListToolsResult, Error>> + Send + '_>>;
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<CallToolResult, Error>> + Send + '_>>;
+    fn list_prompts(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ListPromptsResult, Error>> + Send + '_>>;
+    fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<GetPromptResult, Error>> + Send + '_>>;
+}
+
+#[diagnostic::do_not_recommend]
+impl<T> DynMcpClientTrait for T
+where
+    T: McpClientTrait + Send + Sync + 'static,
+{
+    fn initialize(
+        &mut self,
+        info: ClientInfo,
+        capabilities: ClientCapabilities,
+    ) -> Pin<Box<dyn Future<Output = Result<InitializeResult, Error>> + Send + '_>> {
+        Box::pin(self.initialize(info, capabilities))
+    }
+
+    fn list_resources(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ListResourcesResult, Error>> + Send + '_>> {
+        Box::pin(self.list_resources(next_cursor))
+    }
+
+    fn read_resource(
+        &self,
+        uri: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ReadResourceResult, Error>> + Send + '_>> {
+        let uri = uri.to_owned();
+        Box::pin(async move { self.read_resource(&uri).await })
+    }
+
+    fn list_tools(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ListToolsResult, Error>> + Send + '_>> {
+        Box::pin(self.list_tools(next_cursor))
+    }
+
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<CallToolResult, Error>> + Send + '_>> {
+        let name = name.to_owned();
+        Box::pin(async move { self.call_tool(&name, arguments).await })
+    }
+
+    fn list_prompts(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ListPromptsResult, Error>> + Send + '_>> {
+        Box::pin(self.list_prompts(next_cursor))
+    }
+
+    fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<GetPromptResult, Error>> + Send + '_>> {
+        let name = name.to_owned();
+        Box::pin(async move { self.get_prompt(&name, arguments).await })
+    }
+}
+
+pub struct DynMcpClient(Box<dyn DynMcpClientTrait>);
+impl DynMcpClient {
+    pub fn new<T>(client: T) -> Self
+    where
+        T: McpClientTrait + Send + Sync + 'static,
+    {
+        Self(Box::new(client))
+    }
+
+    pub fn into_inner(self) -> Box<dyn DynMcpClientTrait> {
+        self.0
+    }
+
+    pub fn from_boxed(client: Box<dyn DynMcpClientTrait>) -> Self {
+        Self(client)
+    }
+}
+impl Deref for DynMcpClient {
+    type Target = dyn DynMcpClientTrait;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+impl DerefMut for DynMcpClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
+    }
+}
 /// The MCP client is the interface for MCP operations.
 pub struct McpClient<S>
 where

@@ -1,4 +1,4 @@
-use std::{future::Future, ops::Deref, pin::Pin};
+use std::{future::Future, marker::PhantomData, ops::Deref, pin::Pin};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -36,6 +36,11 @@ pub enum ResourceError {
     NotFound(String),
 }
 
+impl ResourceError {
+    pub fn execution<E: ToString>(e: E) -> Self {
+        Self::ExecutionError(e.to_string())
+    }
+}
 #[derive(Error, Debug)]
 pub enum PromptError {
     #[error("Invalid parameters: {0}")]
@@ -47,7 +52,7 @@ pub enum PromptError {
 }
 
 /// Trait for implementing MCP tools
-pub trait ToolHandler: Send + Sync + 'static {
+pub trait ToolHandler: Send + Sync {
     /// The name of the tool
     fn name(&self) -> &'static str;
 
@@ -65,7 +70,7 @@ pub trait ToolHandler: Send + Sync + 'static {
 }
 
 /// Trait for implementing MCP tools with specified types
-pub trait TypedToolHandler: Send + Sync + 'static {
+pub trait TypedToolHandler<A = ()>: Send + Sync {
     #[cfg(feature = "default_json_schema")]
     type Params: DeserializeOwned + JsonSchema;
 
@@ -90,6 +95,46 @@ pub trait TypedToolHandler: Send + Sync + 'static {
     /// Execute the tool with the given parameters
     fn call(&self, params: Self::Params) -> impl Future<Output = ToolResult<Vec<Content>>> + Send;
 }
+
+pub struct FunctionHandler<F, P, Fut> {
+    name: &'static str,
+    description: &'static str,
+    f: F,
+    _params: PhantomData<fn(P) -> Fut>,
+}
+
+impl<F, P, Fut> FunctionHandler<F, P, Fut> {
+    pub const fn new(name: &'static str, description: &'static str, f: F) -> Self {
+        Self {
+            name,
+            description,
+            f,
+            _params: PhantomData,
+        }
+    }
+}
+
+impl<P, F, Fut> TypedToolHandler for FunctionHandler<F, P, Fut>
+where
+    F: Fn(P) -> Fut + Send + Sync,
+    Fut: Future<Output = ToolResult<Vec<Content>>> + Send,
+    P: DeserializeOwned + JsonSchema + Send + Sync,
+{
+    type Params = P;
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn description(&self) -> &'static str {
+        self.description
+    }
+
+    async fn call(&self, params: Self::Params) -> ToolResult<Vec<Content>> {
+        (self.f)(params).await
+    }
+}
+
 #[diagnostic::do_not_recommend]
 impl<H: TypedToolHandler> ToolHandler for H {
     fn name(&self) -> &'static str {
@@ -131,7 +176,7 @@ impl Deref for DynToolHandler {
 
 impl DynToolHandler {
     /// Convert from a [`TypedToolHandler`]
-    pub fn new<H: ToolHandler>(handler: H) -> Self {
+    pub fn new<H: ToolHandler + 'static>(handler: H) -> Self {
         Self(Box::new(handler))
     }
     pub fn new_boxed(handler: Box<dyn ToolHandler>) -> Self {

@@ -86,18 +86,18 @@ pub trait Router: Send + Sync + 'static {
     // in the protocol, instructions are optional but we make it required
     fn instructions(&self) -> String;
     fn capabilities(&self) -> ServerCapabilities;
-    fn list_tools(&self) -> Vec<mcp_core::tool::Tool>;
+    fn list_tools(&self) -> impl Future<Output = Vec<mcp_core::tool::Tool>>  + Send;
     fn call_tool(
         &self,
         tool_name: &str,
         arguments: Value,
     ) -> impl Future<Output = Result<Vec<Content>, ToolError>> + Send;
-    fn list_resources(&self) -> Vec<mcp_core::resource::Resource>;
+    fn list_resources(&self) -> impl Future<Output = Vec<mcp_core::resource::Resource>> + Send;
     fn read_resource(
         &self,
         uri: &str,
     ) -> impl Future<Output = Result<String, ResourceError>> + Send;
-    fn list_prompts(&self) -> Vec<Prompt>;
+    fn list_prompts(&self) -> impl Future<Output = Vec<Prompt>> + Send;
     fn get_prompt(
         &self,
         prompt_name: &str,
@@ -143,7 +143,7 @@ pub trait Router: Send + Sync + 'static {
         req: JsonRpcRequest,
     ) -> impl Future<Output = Result<JsonRpcResponse, RouterError>> + Send {
         async move {
-            let tools = self.list_tools();
+            let tools = self.list_tools().await;
 
             let result = ListToolsResult {
                 tools,
@@ -201,7 +201,7 @@ pub trait Router: Send + Sync + 'static {
         req: JsonRpcRequest,
     ) -> impl Future<Output = Result<JsonRpcResponse, RouterError>> + Send {
         async move {
-            let resources = self.list_resources();
+            let resources = self.list_resources().await;
 
             let result = ListResourcesResult {
                 resources,
@@ -256,7 +256,7 @@ pub trait Router: Send + Sync + 'static {
         req: JsonRpcRequest,
     ) -> impl Future<Output = Result<JsonRpcResponse, RouterError>> + Send {
         async move {
-            let prompts = self.list_prompts();
+            let prompts = self.list_prompts().await;
 
             let result = ListPromptsResult { prompts };
 
@@ -294,7 +294,7 @@ pub trait Router: Send + Sync + 'static {
 
             // Fetch the prompt definition first
             let prompt = self
-                .list_prompts()
+                .list_prompts().await
                 .into_iter()
                 .find(|p| p.name == prompt_name)
                 .ok_or_else(|| {

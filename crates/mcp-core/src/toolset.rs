@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, collections::HashMap, ops::Deref, sync::Arc};
+use std::{borrow::Borrow, collections::HashMap, ops::Deref};
 
 use serde_json::Value;
 
@@ -21,7 +21,7 @@ impl std::fmt::Debug for ToolSet {
 }
 
 impl ToolSet {
-    pub fn add_tool<H: ToolHandler>(&mut self, tool: H) -> Option<DynToolHandler> {
+    pub fn add_tool<H: ToolHandler + 'static>(&mut self, tool: H) -> Option<DynToolHandler> {
         self.tools.insert(tool.name(), DynToolHandler::new(tool))
     }
     pub fn add_boxed_tool(&mut self, tool: Box<dyn ToolHandler>) -> Option<DynToolHandler> {
