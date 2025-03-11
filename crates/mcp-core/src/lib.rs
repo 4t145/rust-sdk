@@ -7,7 +7,7 @@ pub mod tool;
 pub use tool::{Tool, ToolCall};
 pub mod resource;
 pub use resource::{Resource, ResourceContents};
-pub mod protocol;
+pub mod schema;
 pub use handler::{ToolError, ToolResult};
 pub mod prompt;
 pub mod toolset;

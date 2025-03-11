@@ -3,7 +3,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use mcp_core::{
     handler::{PromptError, ResourceError},
     prompt::{Prompt, PromptArgument},
-    protocol::ServerCapabilities,
+    schema::ServerCapabilities,
     Content, Resource, Tool, ToolError,
 };
 use mcp_server::router::CapabilitiesBuilder;

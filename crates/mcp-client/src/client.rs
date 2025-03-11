@@ -1,4 +1,4 @@
-use mcp_core::protocol::{
+use mcp_core::schema::{
     CallToolResult, GetPromptResult, Implementation, InitializeResult, JsonRpcError,
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ListPromptsResult,
     ListResourcesResult, ListToolsResult, METHOD_NOT_FOUND, ReadResourceResult, ServerCapabilities,

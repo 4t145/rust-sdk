@@ -1,4 +1,4 @@
-use mcp_core::protocol::JsonRpcMessage;
+use mcp_core::schema::JsonRpcMessage;
 use std::{collections::HashMap, future::Future};
 use thiserror::Error;
 use tokio::sync::{RwLock, mpsc, oneshot};

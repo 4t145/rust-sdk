@@ -56,9 +56,9 @@ pub enum RouterError {
     PromptNotFound(String),
 }
 
-impl From<RouterError> for mcp_core::protocol::ErrorData {
+impl From<RouterError> for mcp_core::schema::ErrorData {
     fn from(err: RouterError) -> Self {
-        use mcp_core::protocol::*;
+        use mcp_core::schema::*;
         match err {
             RouterError::MethodNotFound(msg) => ErrorData {
                 code: METHOD_NOT_FOUND,

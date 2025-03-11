@@ -5,14 +5,9 @@ use std::{
 
 use futures::{Future, Sink, Stream};
 use mcp_core::{
-    Content, ResourceContents, ToolError,
-    handler::{PromptError, ResourceError},
-    prompt::{Prompt, PromptMessage, PromptMessageRole},
-    protocol::{
-        CallToolResult, GetPromptResult, Implementation, InitializeResult, JsonRpcError,
-        JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion2_0, ListPromptsResult,
-        ListResourcesResult, ListToolsResult, ReadResourceResult, ServerCapabilities,
-    },
+    handler::{PromptError, ResourceError}, prompt::{Prompt, PromptMessage, PromptMessageRole}, schema::{
+        CallToolResult, ClientJsonRpcMessage, ClientRequest, ClientResult, GetPromptResult, Implementation, InitializeResult, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion2_0, ListPromptsResult, ListResourcesResult, ListToolsResult, ReadResourceResult, ServerCapabilities, ServerJsonRpcMessage, ServerRequest
+    }, Content, ResourceContents, ToolError
 };
 use pin_project::pin_project;
 use serde_json::Value;
@@ -464,24 +459,23 @@ where
     pub async fn handle(
         &self,
         context: McpServerContext<'_>,
-        request: JsonRpcRequest,
-    ) -> Result<JsonRpcResponse, BoxError> {
-        let result = match request.method.as_str() {
-            "initialize" => self.handle_initialize(request, context).await,
-            "tools/list" => self.handle_tools_list(request, context).await,
-            "tools/call" => self.handle_tools_call(request, context).await,
-            "resources/list" => self.handle_resources_list(request, context).await,
-            "resources/read" => self.handle_resources_read(request, context).await,
-            "prompts/list" => self.handle_prompts_list(request, context).await,
-            "prompts/get" => self.handle_prompts_get(request, context).await,
-            _ => {
-                let mut response = self.create_response(request.id);
-                response.error = Some(RouterError::MethodNotFound(request.method).into());
-                Ok(response)
-            }
-        };
-
-        result.map_err(BoxError::from)
+        request: ClientRequest,
+    ) -> Result<ClientResult, BoxError> {
+        match request {
+            ClientRequest::PingRequest(request) => todo!(),
+            ClientRequest::InitializeRequest(request) => todo!(),
+            ClientRequest::CompleteRequest(request) => todo!(),
+            ClientRequest::SetLevelRequest(request) => todo!(),
+            ClientRequest::GetPromptRequest(request) => todo!(),
+            ClientRequest::ListPromptsRequest(request) => todo!(),
+            ClientRequest::ListResourcesRequest(request) => todo!(),
+            ClientRequest::ListResourceTemplatesRequest(request) => todo!(),
+            ClientRequest::ReadResourceRequest(request) => todo!(),
+            ClientRequest::SubscribeRequest(request) => todo!(),
+            ClientRequest::UnsubscribeRequest(request) => todo!(),
+            ClientRequest::CallToolRequest(request) => todo!(),
+            ClientRequest::ListToolsRequest(request) => todo!(),
+        }
     }
     pub async fn run<T>(self, mut transport: T) -> Result<(), ServerError>
     where
@@ -491,7 +485,7 @@ where
 
         tracing::info!("Server started");
         let (mut sink, mut stream) = transport.split();
-        let message_sink = 
+        // let message_sink = tokio::sync::
         // let mut stream = std::pin::pin!(stream);
         while let Some(msg_result) = stream.next().await {
             let _span = tracing::span!(tracing::Level::INFO, "message_processing");
@@ -522,8 +516,8 @@ where
                                         jsonrpc: JsonRpcVersion2_0,
                                         id,
                                         result: None,
-                                        error: Some(mcp_core::protocol::ErrorData {
-                                            code: mcp_core::protocol::INTERNAL_ERROR,
+                                        error: Some(mcp_core::schema::ErrorData {
+                                            code: mcp_core::schema::INTERNAL_ERROR,
                                             message: error_msg,
                                             data: None,
                                         }),
@@ -558,19 +552,19 @@ where
                     // Convert transport error to JSON-RPC error response
                     let error = match e {
                         TransportError::Json(_) | TransportError::InvalidMessage(_) => {
-                            mcp_core::protocol::ErrorData {
-                                code: mcp_core::protocol::PARSE_ERROR,
+                            mcp_core::schema::ErrorData {
+                                code: mcp_core::schema::PARSE_ERROR,
                                 message: e.to_string(),
                                 data: None,
                             }
                         }
-                        TransportError::Protocol(_) => mcp_core::protocol::ErrorData {
-                            code: mcp_core::protocol::INVALID_REQUEST,
+                        TransportError::Protocol(_) => mcp_core::schema::ErrorData {
+                            code: mcp_core::schema::INVALID_REQUEST,
                             message: e.to_string(),
                             data: None,
                         },
-                        _ => mcp_core::protocol::ErrorData {
-                            code: mcp_core::protocol::INTERNAL_ERROR,
+                        _ => mcp_core::schema::ErrorData {
+                            code: mcp_core::schema::INTERNAL_ERROR,
                             message: e.to_string(),
                             data: None,
                         },
@@ -594,7 +588,7 @@ where
 }
 
 pub trait McpServerTransport:
-    Stream<Item = Result<JsonRpcMessage, TransportError>> + Sink<JsonRpcMessage, Error = std::io::Error>
+    Stream<Item = Result<ClientJsonRpcMessage, TransportError>> + Sink<ServerJsonRpcMessage, Error = std::io::Error>
 {
 }
 
@@ -653,8 +647,8 @@ where
                                         jsonrpc: JsonRpcVersion2_0,
                                         id,
                                         result: None,
-                                        error: Some(mcp_core::protocol::ErrorData {
-                                            code: mcp_core::protocol::INTERNAL_ERROR,
+                                        error: Some(mcp_core::schema::ErrorData {
+                                            code: mcp_core::schema::INTERNAL_ERROR,
                                             message: error_msg,
                                             data: None,
                                         }),
@@ -689,19 +683,19 @@ where
                     // Convert transport error to JSON-RPC error response
                     let error = match e {
                         TransportError::Json(_) | TransportError::InvalidMessage(_) => {
-                            mcp_core::protocol::ErrorData {
-                                code: mcp_core::protocol::PARSE_ERROR,
+                            mcp_core::schema::ErrorData {
+                                code: mcp_core::schema::PARSE_ERROR,
                                 message: e.to_string(),
                                 data: None,
                             }
                         }
-                        TransportError::Protocol(_) => mcp_core::protocol::ErrorData {
-                            code: mcp_core::protocol::INVALID_REQUEST,
+                        TransportError::Protocol(_) => mcp_core::schema::ErrorData {
+                            code: mcp_core::schema::INVALID_REQUEST,
                             message: e.to_string(),
                             data: None,
                         },
-                        _ => mcp_core::protocol::ErrorData {
-                            code: mcp_core::protocol::INTERNAL_ERROR,
+                        _ => mcp_core::schema::ErrorData {
+                            code: mcp_core::schema::INTERNAL_ERROR,
                             message: e.to_string(),
                             data: None,
                         },

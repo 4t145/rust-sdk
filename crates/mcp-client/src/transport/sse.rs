@@ -1,7 +1,7 @@
 use crate::transport::{Error, PendingRequests, TransportMessage};
 use eventsource_client::{Client, SSE};
 use futures::TryStreamExt;
-use mcp_core::protocol::{JsonRpcMessage, JsonRpcRequest};
+use mcp_core::schema::{JsonRpcMessage, JsonRpcRequest};
 use reqwest::Client as HttpClient;
 use std::collections::HashMap;
 use std::sync::Arc;
