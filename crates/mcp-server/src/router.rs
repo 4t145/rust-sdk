@@ -106,13 +106,13 @@ pub trait Router: Send + Sync + 'static {
     // Helper method to create base response
     fn create_response(&self, id: Option<u64>) -> JsonRpcResponse {
         JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: Default::default(),
             id,
             result: None,
             error: None,
         }
     }
-
+    
     fn handle_initialize(
         &self,
         req: JsonRpcRequest,

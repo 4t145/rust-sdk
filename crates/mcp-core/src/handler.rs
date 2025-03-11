@@ -1,4 +1,4 @@
-use std::{future::Future, marker::PhantomData, ops::Deref, pin::Pin};
+use std::{borrow::Cow, future::Future, marker::PhantomData, ops::Deref, pin::Pin};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -50,6 +50,18 @@ pub enum PromptError {
     #[error("Prompt not found: {0}")]
     NotFound(String),
 }
+
+#[derive(Error, Debug)]
+pub enum NotificationError {
+    #[error("Invalid parameters: {0}")]
+    InvalidParameters(String),
+    #[error("Internal error: {0}")]
+    InternalError(String),
+    #[error("Prompt not found: {0}")]
+    NotFound(String),
+}
+
+type NotificationResult = Result<(), NotificationError>;
 
 /// Trait for implementing MCP tools
 pub trait ToolHandler: Send + Sync {
@@ -196,8 +208,22 @@ pub trait ResourceTemplateHandler: Send + Sync + 'static {
     fn get(&self, params: Value) -> impl Future<Output = ToolResult<String>>;
 }
 
+pub trait NotificationHandler: Send + Sync + 'static {
+    fn method(&self) -> Cow<'static, str>;
+    /// JSON schema describing the resource parameters
+    fn schema() -> Value;
+    fn notify(&self, method: String) -> impl Future<Output = NotificationResult> + Send + '_;
+}
+
+pub trait TypedNotificationHandler: Send + Sync + 'static {
+    fn method(&self) -> Cow<'static, str>; 
+    fn notify(&self, method: String) -> impl Future<Output = NotificationResult> + Send + '_;
+}
+
 /// Helper function to generate JSON schema for a type
 pub fn generate_schema<T: JsonSchema>() -> ToolResult<Value> {
     let schema = schemars::schema_for!(T);
     serde_json::to_value(schema).map_err(|e| ToolError::SchemaError(e.to_string()))
 }
+
+

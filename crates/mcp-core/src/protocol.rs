@@ -9,9 +9,37 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JsonRpcVersion2_0;
+const JSON_RPC_VERSION: &str = "2.0";
+impl Serialize for JsonRpcVersion2_0 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        JSON_RPC_VERSION.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonRpcVersion2_0 {
+    fn deserialize<D>(deserializer: D) -> Result<JsonRpcVersion2_0, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let version: String = Deserialize::deserialize(deserializer)?;
+        if version.trim().starts_with(JSON_RPC_VERSION) {
+            Ok(JsonRpcVersion2_0)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "Invalid JSON-RPC version, expect {JSON_RPC_VERSION}"
+            )))
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct JsonRpcRequest {
-    pub jsonrpc: String,
+    pub jsonrpc: JsonRpcVersion2_0,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
     pub method: String,
@@ -21,7 +49,7 @@ pub struct JsonRpcRequest {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct JsonRpcResponse {
-    pub jsonrpc: String,
+    pub jsonrpc: JsonRpcVersion2_0,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,7 +60,7 @@ pub struct JsonRpcResponse {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct JsonRpcNotification {
-    pub jsonrpc: String,
+    pub jsonrpc: JsonRpcVersion2_0,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
@@ -40,7 +68,7 @@ pub struct JsonRpcNotification {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct JsonRpcError {
-    pub jsonrpc: String,
+    pub jsonrpc: JsonRpcVersion2_0,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
     pub error: ErrorData,
@@ -58,7 +86,7 @@ pub enum JsonRpcMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRaw {
-    jsonrpc: String,
+    jsonrpc: JsonRpcVersion2_0,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -245,7 +273,7 @@ mod tests {
     #[test]
     fn test_notification_conversion() {
         let raw = JsonRpcRaw {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JsonRpcVersion2_0,
             id: None,
             method: Some("notify".to_string()),
             params: Some(json!({"key": "value"})),
@@ -256,7 +284,6 @@ mod tests {
         let message = JsonRpcMessage::try_from(raw).unwrap();
         match message {
             JsonRpcMessage::Notification(n) => {
-                assert_eq!(n.jsonrpc, "2.0");
                 assert_eq!(n.method, "notify");
                 assert_eq!(n.params.unwrap(), json!({"key": "value"}));
             }
@@ -267,7 +294,7 @@ mod tests {
     #[test]
     fn test_request_conversion() {
         let raw = JsonRpcRaw {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JsonRpcVersion2_0,
             id: Some(1),
             method: Some("request".to_string()),
             params: Some(json!({"key": "value"})),
@@ -278,7 +305,6 @@ mod tests {
         let message = JsonRpcMessage::try_from(raw).unwrap();
         match message {
             JsonRpcMessage::Request(r) => {
-                assert_eq!(r.jsonrpc, "2.0");
                 assert_eq!(r.id, Some(1));
                 assert_eq!(r.method, "request");
                 assert_eq!(r.params.unwrap(), json!({"key": "value"}));
