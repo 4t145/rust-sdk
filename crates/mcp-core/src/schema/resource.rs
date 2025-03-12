@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::content::Annotations;
+use super::content::Annotations;
 
 const EPSILON: f32 = 1e-6; // Tolerance for floating point comparison
 

@@ -2,7 +2,7 @@
 /// The various content types can be display to humans but also understood by models
 /// They include optional annotations used to help inform agent usage
 use super::role::Role;
-use crate::resource::ResourceContents;
+use super::resource::ResourceContents;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

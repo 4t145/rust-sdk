@@ -11,20 +11,25 @@ description = "Core types for Model Context Protocol"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
-schemars = "0.8"
 anyhow = "1.0"
 chrono = { version = "0.4.38", features = ["serde"] }
 url = "2.5"
 base64 = "0.21"
 tower-service = "0.3"
-tokio = {version = "1", features = ["sync", "macros", "io-util"]}
+tokio = { version = "1", features = ["sync", "macros"] }
 futures = "0.3"
-tracing = { version = "0.1"}
-tokio-util = { version = "0.7", features = ["io", "codec"]}
+tracing = { version = "0.1" }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
 pin-project-lite = "0.2"
+
+schemars = { version = "0.8", optional = true }
+
 [features]
-default = ["default_json_schema"]
-default_json_schema = []
+
+default = ["json_schema", "tokio_io"]
+tokio_io = ["tokio/io-util"]
+json_schema = ["dep:schemars"]
 
 [dev-dependencies]
 tempfile = "3.8"
+tokio = { version = "1", features = ["sync", "macros", "io-util", "rt"] }

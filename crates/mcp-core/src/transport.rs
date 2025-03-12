@@ -1,9 +1,10 @@
 use futures::{Sink, Stream};
-
+#[cfg(feature = "tokio_io")]
 pub mod tokio_io;
+pub mod tokio_channel;
+
 
 pin_project_lite::pin_project! {
-
     pub struct Transport<Tx, Rx> {
         #[pin]
         rx: Rx,

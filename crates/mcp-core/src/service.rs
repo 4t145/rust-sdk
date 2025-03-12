@@ -1,6 +1,6 @@
 use crate::error::Error as McpError;
 use crate::schema::*;
-use futures::{Sink, Stream};
+use futures::{Sink, Stream, SinkExt, StreamExt};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -9,24 +9,26 @@ pub enum ServiceError {
     McpError(McpError),
     #[error("Transport error: {0}")]
     Transport(std::io::Error),
+    #[error("Unexpected response type")]
+    UnexpectedResponse,
 }
 
-impl ServiceError {
-    pub fn into_mcp_error(self) -> McpError {
-        match self {
-            ServiceError::McpError(error) => error,
-            ServiceError::Transport(error) => McpError::internal(error),
-        }
-    }
-}
+impl ServiceError {}
 
-pub trait ServiceRole {
-    type Req;
-    type Resp;
-    type Not;
-    type PeerReq;
-    type PeerResp;
-    type PeerNot;
+pub trait ServiceRole: std::fmt::Debug {
+    type Req: std::fmt::Debug;
+    type Resp: std::fmt::Debug;
+    type Not: std::fmt::Debug;
+    type PeerReq: std::fmt::Debug;
+    type PeerResp: std::fmt::Debug;
+    type PeerNot: std::fmt::Debug;
+    const IS_CLIENT: bool;
+    async fn initialize<S, Rx, Tx, E>(service: S, rx: Rx, tx: Tx) -> Result<(), E>
+    where
+        S: Service<Role = Self>,
+        Rx: Stream<Item = JsonRpcMessage<Self::PeerReq, Self::PeerResp, Self::PeerNot>>,
+        Tx: Sink<JsonRpcMessage<Self::Req, Self::Resp, Self::Not>, Error = E>
+    ;
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -40,6 +42,14 @@ impl ServiceRole for RoleClient {
     type PeerReq = ServerRequest;
     type PeerResp = ServerResult;
     type PeerNot = ServerNotification;
+    const IS_CLIENT: bool = true;
+    async fn initialize<S, Rx, Tx, E>(service: S, rx: Rx, tx: Tx) -> Result<(), E>
+        where
+            S: Service<Role = Self>,
+            Rx: Stream<Item = JsonRpcMessage<Self::PeerReq, Self::PeerResp, Self::PeerNot>>,
+            Tx: Sink<JsonRpcMessage<Self::Req, Self::Resp, Self::Not>, Error = E> {
+        tx.send(ClientMessage::Request(ClientRequest::InitializeRequest(()), ()))
+    }
 }
 
 impl ServiceRole for RoleServer {
@@ -49,6 +59,14 @@ impl ServiceRole for RoleServer {
     type PeerReq = ClientRequest;
     type PeerResp = ClientResult;
     type PeerNot = ClientNotification;
+    const IS_CLIENT: bool = false;
+    async fn initialize<S, Rx, Tx, E>(service: S, rx: Rx, tx: Tx) -> Result<(), E>
+        where
+            S: Service<Role = Self>,
+            Rx: Stream<Item = JsonRpcMessage<Self::PeerReq, Self::PeerResp, Self::PeerNot>>,
+            Tx: Sink<JsonRpcMessage<Self::Req, Self::Resp, Self::Not>, Error = E> {
+        
+    }
 }
 
 pub trait Service {
@@ -56,11 +74,11 @@ pub trait Service {
     fn handle_request(
         &self,
         request: <Self::Role as ServiceRole>::PeerReq,
-    ) -> impl Future<Output = Result<<Self::Role as ServiceRole>::Resp, ServiceError>> + '_;
+    ) -> impl Future<Output = Result<<Self::Role as ServiceRole>::Resp, McpError>> + '_;
     fn handle_notification(
         &self,
         notification: <Self::Role as ServiceRole>::PeerNot,
-    ) -> impl Future<Output = Result<(), ServiceError>> + '_;
+    ) -> impl Future<Output = Result<(), McpError>> + '_;
     fn send_request(
         &self,
         request: <Self::Role as ServiceRole>::Req,
@@ -113,7 +131,7 @@ impl RequestIdProvider for AtomicU32RequestIdProvider {
 }
 
 type Responder<T> = tokio::sync::oneshot::Sender<T>;
-
+#[derive(Debug)]
 pub enum PeerProxyMessage<R: ServiceRole> {
     Request(R::Req, RequestId, Responder<Result<R::PeerResp, ErrorData>>),
     Notification(R::Not),
@@ -156,7 +174,7 @@ impl<R: ServiceRole> PeerProxy<R> {
         let response = receiver
             .await
             .map_err(|_e| ServiceError::Transport(std::io::Error::other("disconnected")))?;
-        let message = response.map_err(|e| ServiceError::McpError(e.into()))?;
+        let message = response.map_err(ServiceError::McpError)?;
         Ok(message)
     }
 }
@@ -178,19 +196,27 @@ where
             >,
             Error = E,
         >,
-    E: std::error::Error,
 {
     use futures::{SinkExt, StreamExt};
 
     tracing::info!("Server started");
     let (mut sink, mut stream) = transport.split();
+
     let id_provider = Arc::new(AtomicU32RequestIdProvider::default());
+
+    if S::Role::IS_CLIENT {
+        tracing::info!("Initialize as client");
+    } else {
+        tracing::info!("Initialize as server");
+    }
+
     let (client, mut media) = <PeerProxy<S::Role>>::new(id_provider);
     service.set_peer_proxy(client);
     let mut local_responder_pool = HashMap::new();
 
     // let message_sink = tokio::sync::
     // let mut stream = std::pin::pin!(stream);
+    #[derive(Debug)]
     enum Event<P, R> {
         ProxyMessage(P),
         RemoteMessage(R),
@@ -212,6 +238,7 @@ where
                 }
             }
         };
+        tracing::debug!(?evt, "new event");
         match evt {
             Event::ProxyMessage(PeerProxyMessage::Request(request, id, responder)) => {
                 local_responder_pool.insert(id.clone(), responder);
@@ -223,10 +250,17 @@ where
                     .await?;
             }
             Event::RemoteMessage(Message::Request(request, id)) => {
+                tracing::info!(%id, ?request, "received request");
                 // Process the request using our service
                 let response = match service.handle_request(request).await {
-                    Ok(result) => Message::Response(result, id),
-                    Err(e) => Message::Error(e.into_mcp_error().into(), id),
+                    Ok(result) => {
+                        tracing::info!(%id, ?result, "response message");
+                        Message::Response(result, id)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%id, ?error, "response error");
+                        Message::Error(error, id)
+                    }
                 }
                 .into_json_rpc_message();
 

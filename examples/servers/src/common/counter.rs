@@ -1,42 +1,96 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
-use mcp_core::{
-    handler::{PromptError, ResourceError},
-    prompt::{Prompt, PromptArgument, PromptMessage, PromptMessageContent, PromptMessageRole},
-    schema::*,
-    Content, Resource, ResourceContents, Role, Tool, ToolError,
+use mcp_core::schema::*;
+use mcp_server::{
+    ServerHandler,
+    handler::tool::{ToolSet, ToolTrait},
 };
-use mcp_server::Handler;
-use serde_json::Value;
+use serde_json::json;
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct Counter {
-    counter: Arc<Mutex<i32>>,
+    _counter: Arc<Mutex<i32>>,
+    tool_set: Arc<ToolSet>,
+}
+
+pub struct IncrementTool(Arc<Mutex<i32>>);
+
+impl ToolTrait for IncrementTool {
+    type Params = EmptyObject;
+
+    fn name(&self) -> Cow<'static, str> {
+        "increment".into()
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        "Increment the counter by 1".into()
+    }
+
+    async fn call(&self, _params: Self::Params) -> Result<CallToolResult, mcp_core::error::Error> {
+        let mut counter = self.0.lock().await;
+        *counter += 1;
+        Ok(CallToolResult::success(vec![Content::text(
+            counter.to_string(),
+        )]))
+    }
+}
+
+pub struct DecrementTool(Arc<Mutex<i32>>);
+
+impl ToolTrait for DecrementTool {
+    type Params = EmptyObject;
+
+    fn name(&self) -> Cow<'static, str> {
+        "decrement".into()
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        "Decrement the counter by 1".into()
+    }
+
+    async fn call(&self, _params: Self::Params) -> Result<CallToolResult, mcp_core::error::Error> {
+        let mut counter = self.0.lock().await;
+        *counter -= 1;
+        Ok(CallToolResult::success(vec![Content::text(
+            counter.to_string(),
+        )]))
+    }
+}
+
+pub struct GetValueTool(Arc<Mutex<i32>>);
+
+impl ToolTrait for GetValueTool {
+    type Params = EmptyObject;
+
+    fn name(&self) -> Cow<'static, str> {
+        "get_value".into()
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        "Get the current counter value".into()
+    }
+
+    async fn call(&self, _params: Self::Params) -> Result<CallToolResult, mcp_core::error::Error> {
+        let counter = self.0.lock().await;
+        Ok(CallToolResult::success(vec![Content::text(
+            counter.to_string(),
+        )]))
+    }
 }
 
 impl Counter {
     pub fn new() -> Self {
+        let mut tool_set = ToolSet::default();
+        let counter = Arc::new(Mutex::new(0));
+
+        tool_set.add_tool(IncrementTool(counter.clone()));
+        tool_set.add_tool(DecrementTool(counter.clone()));
+        tool_set.add_tool(GetValueTool(counter.clone()));
         Self {
-            counter: Arc::new(Mutex::new(0)),
+            _counter: Arc::new(Mutex::new(0)),
+            tool_set: Arc::new(tool_set),
         }
-    }
-
-    async fn increment(&self) -> i32 {
-        let mut counter = self.counter.lock().await;
-        *counter += 1;
-        *counter
-    }
-
-    async fn decrement(&self) -> i32 {
-        let mut counter = self.counter.lock().await;
-        *counter -= 1;
-        *counter
-    }
-
-    async fn get_value(&self) -> i32 {
-        let counter = self.counter.lock().await;
-        *counter
     }
 
     fn _create_resource_text(&self, uri: &str, name: &str) -> Resource {
@@ -44,7 +98,7 @@ impl Counter {
     }
 }
 
-impl Handler for Counter {
+impl ServerHandler for Counter {
     async fn initialize(
         &self,
         _request: mcp_core::schema::InitializeRequestParam,
@@ -54,8 +108,8 @@ impl Handler for Counter {
             capabilities: ServerCapabilities {
                 experimental: None,
                 logging: None,
-                prompts: None,
-                resources: None,
+                prompts: Some(PromptsCapability::default()),
+                resources: Some(ResourcesCapability::default()),
                 tools: Some(ToolsCapability {
                     list_changed: None,
                 }),
@@ -68,35 +122,7 @@ impl Handler for Counter {
         &self,
         _request: mcp_core::schema::PaginatedRequestParam,
     ) -> Result<mcp_core::schema::ListToolsResult, mcp_core::error::Error> {
-        let tools = vec![
-            Tool::new(
-                "increment".to_string(),
-                "Increment the counter by 1".to_string(),
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }),
-            ),
-            Tool::new(
-                "decrement".to_string(),
-                "Decrement the counter by 1".to_string(),
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }),
-            ),
-            Tool::new(
-                "get_value".to_string(),
-                "Get the current counter value".to_string(),
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }),
-            ),
-        ];
+        let tools = self.tool_set.list_all();
         Ok(ListToolsResult {
             next_cursor: None,
             tools,
@@ -105,34 +131,14 @@ impl Handler for Counter {
 
     async fn call_tool(
         &self,
-        CallToolRequestParam { name, arguments: _ }: CallToolRequestParam,
+        CallToolRequestParam { name, arguments }: CallToolRequestParam,
     ) -> Result<CallToolResult, mcp_core::error::Error> {
-        match name.as_str() {
-            "increment" => {
-                let value = self.increment().await;
-                Ok(CallToolResult::success(vec![Content::text(
-                    value.to_string(),
-                )]))
-            }
-            "decrement" => {
-                let value = self.decrement().await;
-                Ok(CallToolResult::success(vec![Content::text(
-                    value.to_string(),
-                )]))
-            }
-            "get_value" => {
-                let value = self.get_value().await;
-                Ok(CallToolResult::success(vec![Content::text(
-                    value.to_string(),
-                )]))
-            }
-            _ => Err(mcp_core::error::Error::not_found()),
-        }
+        self.tool_set.call(&name, arguments).await
     }
 
     async fn list_resources(
         &self,
-        request: mcp_core::schema::PaginatedRequestParam,
+        _request: mcp_core::schema::PaginatedRequestParam,
     ) -> Result<mcp_core::schema::ListResourcesResult, mcp_core::error::Error> {
         Ok(mcp_core::schema::ListResourcesResult {
             resources: vec![
@@ -160,7 +166,12 @@ impl Handler for Counter {
                     contents: vec![ResourceContents::text(memo, uri)],
                 })
             }
-            _ => Err(mcp_core::error::Error::not_found()),
+            _ => Err(mcp_core::error::Error::resource_not_found(
+                "resource_not_found",
+                Some(json!({
+                    "uri": uri
+                })),
+            )),
         }
     }
 
@@ -184,7 +195,7 @@ impl Handler for Counter {
 
     async fn get_prompt(
         &self,
-        GetPromptRequestParam { name, arguments }: GetPromptRequestParam,
+        GetPromptRequestParam { name, arguments: _ }: GetPromptRequestParam,
     ) -> Result<GetPromptResult, mcp_core::error::Error> {
         match name.as_str() {
             "example_prompt" => {
@@ -197,7 +208,20 @@ impl Handler for Counter {
                     }],
                 })
             }
-            _ => Err(mcp_core::error::Error::not_found()),
+            _ => Err(mcp_core::error::Error::invalid_params(
+                "prompt not found",
+                None,
+            )),
         }
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: PaginatedRequestParam,
+    ) -> Result<ListResourceTemplatesResult, mcp_core::error::Error> {
+        Ok(ListResourceTemplatesResult {
+            next_cursor: None,
+            resource_templates: Vec::new(),
+        })
     }
 }

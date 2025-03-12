@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 // use crate::schema::*;
-use futures::{Sink, Stream, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -15,7 +15,7 @@ use super::Transport;
 pub fn tokio_rw<I, O, R, W>(
     read: R,
     write: W,
-) -> impl Sink<O, Error = JsonRpcMessageCodecError> + Stream<Item = I>
+) -> impl Sink<O, Error = std::io::Error> + Stream<Item = I>
 where
     R: AsyncRead,
     W: AsyncWrite,
@@ -25,15 +25,19 @@ where
     Transport::new(from_async_write(write), from_async_read(read))
 }
 
-pub fn from_async_read<R: AsyncRead, T: DeserializeOwned>(reader: R) -> impl Stream<Item = T> {
-    FramedRead::new(reader, JsonRpcMessageCodec::<T>::default())
-        .filter_map(|x| futures::future::ready(x.ok()))
+pub fn from_async_read<T: DeserializeOwned, R: AsyncRead>(reader: R) -> impl Stream<Item = T> {
+    FramedRead::new(reader, JsonRpcMessageCodec::<T>::default()).filter_map(|result| {
+        if let Err(e) = &result {
+            tracing::error!("Error reading from stream: {}", e);
+        }
+        futures::future::ready(result.ok())
+    })
 }
 
-pub fn from_async_write<W: AsyncWrite, T: Serialize>(
+pub fn from_async_write<T: Serialize, W: AsyncWrite>(
     writer: W,
-) -> impl Sink<T, Error = JsonRpcMessageCodecError> {
-    FramedWrite::new(writer, JsonRpcMessageCodec::<T>::default())
+) -> impl Sink<T, Error = std::io::Error> {
+    FramedWrite::new(writer, JsonRpcMessageCodec::<T>::default()).sink_map_err(Into::into)
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +92,18 @@ pub enum JsonRpcMessageCodecError {
     Serde(#[from] serde_json::Error),
     #[error("io error {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<JsonRpcMessageCodecError> for std::io::Error {
+    fn from(value: JsonRpcMessageCodecError) -> Self {
+        match value {
+            JsonRpcMessageCodecError::MaxLineLengthExceeded => {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, value)
+            }
+            JsonRpcMessageCodecError::Serde(e) => e.into(),
+            JsonRpcMessageCodecError::Io(e) => e,
+        }
+    }
 }
 
 impl<T: DeserializeOwned> Decoder for JsonRpcMessageCodec<T> {
@@ -182,5 +198,85 @@ impl<T: Serialize> Encoder<T> for JsonRpcMessageCodec<T> {
         serde_json::to_writer(buf.writer(), &item)?;
         buf.put_u8(b'\n');
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[tokio::test]
+    async fn test_decode() {
+        use futures::StreamExt;
+        use tokio::io::BufReader;
+
+        let data = r#"{"jsonrpc":"2.0","method":"subtract","params":[42,23],"id":1}
+    {"jsonrpc":"2.0","method":"subtract","params":[23,42],"id":2}
+    {"jsonrpc":"2.0","method":"subtract","params":[42,23],"id":3}
+    {"jsonrpc":"2.0","method":"subtract","params":[23,42],"id":4}
+    {"jsonrpc":"2.0","method":"subtract","params":[42,23],"id":5}
+    {"jsonrpc":"2.0","method":"subtract","params":[23,42],"id":6}
+    {"jsonrpc":"2.0","method":"subtract","params":[42,23],"id":7}
+    {"jsonrpc":"2.0","method":"subtract","params":[23,42],"id":8}
+    {"jsonrpc":"2.0","method":"subtract","params":[42,23],"id":9}
+    {"jsonrpc":"2.0","method":"subtract","params":[23,42],"id":10}
+    
+    "#;
+
+        let mut cursor = BufReader::new(data.as_bytes());
+        let mut stream = from_async_read::<serde_json::Value, _>(&mut cursor);
+
+        for i in 1..=10 {
+            let item = stream.next().await.unwrap();
+            assert_eq!(
+                item,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "subtract",
+                    "params": if i % 2 != 0 { [42, 23] } else { [23, 42] },
+                    "id": i,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_encode() {
+        let test_messages = vec![
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "subtract",
+                "params": [42, 23],
+                "id": 1,
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "subtract",
+                "params": [23, 42],
+                "id": 2,
+            }),
+        ];
+
+        // Create a buffer to write to
+        let mut buffer = Vec::new();
+        let mut writer = from_async_write(&mut buffer);
+
+        // Write the test messages
+        for message in test_messages.iter() {
+            writer.send(message.clone()).await.unwrap();
+        }
+        writer.close().await.unwrap();
+        drop(writer);
+        // Parse the buffer back into lines and check each one
+        let output = String::from_utf8_lossy(&buffer);
+        let mut lines = output.lines();
+
+        for expected_message in test_messages {
+            let line = lines.next().unwrap();
+            let parsed_message: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed_message, expected_message);
+        }
+
+        // Make sure there are no extra lines
+        assert!(lines.next().is_none());
     }
 }

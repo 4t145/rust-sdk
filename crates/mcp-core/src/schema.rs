@@ -1,16 +1,22 @@
-use std::{collections::BTreeMap, fmt::Pointer};
-
+use std::{borrow::Cow, collections::BTreeMap};
+mod content;
+mod prompt;
+mod resource;
+mod role;
+mod tool;
 /// The protocol messages exchanged between client and server
-use crate::{
-    Role,
-    content::Content,
-    prompt::{Prompt, PromptMessage},
-    resource::{Resource, ResourceContents},
-    tool::Tool,
-};
+pub use content::*;
+pub use prompt::*;
+pub use resource::*;
+pub use role::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-type JsonObject<F = Value> = serde_json::Map<String, F>;
+pub use tool::*;
+pub type JsonObject<F = Value> = serde_json::Map<String, F>;
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Copy, Eq)]
+#[cfg_attr(feature = "json_schema", derive(schemars::JsonSchema))]
+pub struct EmptyObject {}
 pub trait ConstString {
     const VALUE: &str;
 }
@@ -115,17 +121,27 @@ pub struct WithMeta<P = JsonObject, M = ()> {
 pub struct RequestMeta {
     progress_token: ProgressToken,
 }
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Request<M = String, P = Option<WithMeta<JsonObject, RequestMeta>>> {
     pub method: M,
     // #[serde(skip_serializing_if = "Option::is_none")]
     pub params: P,
 }
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct RequestNoParam<M = String> {
+    pub method: M,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Notification<M = String, P = Option<WithMeta<JsonObject, JsonObject>>> {
     pub method: M,
     pub params: P,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct NotificationNoParam<M = String> {
+    pub method: M,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -163,11 +179,12 @@ pub struct JsonRpcNotification<N = Notification> {
 pub struct ErrorCode(pub i32);
 
 impl ErrorCode {
-    pub const PARSE_ERROR: Self = Self(-32700);
+    pub const RESOURCE_NOT_FOUND: Self = Self(-32002);
     pub const INVALID_REQUEST: Self = Self(-32600);
     pub const METHOD_NOT_FOUND: Self = Self(-32601);
     pub const INVALID_PARAMS: Self = Self(-32602);
     pub const INTERNAL_ERROR: Self = Self(-32603);
+    pub const PARSE_ERROR: Self = Self(-32700);
 }
 
 /// Error information for JSON-RPC error responses.
@@ -177,7 +194,7 @@ pub struct ErrorData {
     pub code: ErrorCode,
 
     /// A short description of the error. The message SHOULD be limited to a concise single sentence.
-    pub message: String,
+    pub message: Cow<'static, str>,
 
     /// Additional information about the error. The value of this member is defined by the
     /// sender (e.g. detailed error information, nested errors etc.).
@@ -186,26 +203,33 @@ pub struct ErrorData {
 }
 
 impl ErrorData {
-    pub fn new(code: ErrorCode, message: String, data: Option<Value>) -> Self {
+    pub fn new(
+        code: ErrorCode,
+        message: impl Into<Cow<'static, str>>,
+        data: Option<Value>,
+    ) -> Self {
         Self {
             code,
-            message,
+            message: message.into(),
             data,
         }
     }
-    pub fn parse_error(message: String, data: Option<Value>) -> Self {
+    pub fn resource_not_found(message: impl Into<Cow<'static, str>>, data: Option<Value>) -> Self {
+        Self::new(ErrorCode::RESOURCE_NOT_FOUND, message, data)
+    }
+    pub fn parse_error(message: impl Into<Cow<'static, str>>, data: Option<Value>) -> Self {
         Self::new(ErrorCode::PARSE_ERROR, message, data)
     }
-    pub fn invalid_request(message: String, data: Option<Value>) -> Self {
+    pub fn invalid_request(message: impl Into<Cow<'static, str>>, data: Option<Value>) -> Self {
         Self::new(ErrorCode::INVALID_REQUEST, message, data)
     }
-    pub fn method_not_found(message: String, data: Option<Value>) -> Self {
-        Self::new(ErrorCode::METHOD_NOT_FOUND, message, data)
+    pub fn method_not_found<M: ConstString>() -> Self {
+        Self::new(ErrorCode::METHOD_NOT_FOUND, M::VALUE, None)
     }
-    pub fn invalid_params(message: String, data: Option<Value>) -> Self {
+    pub fn invalid_params(message: impl Into<Cow<'static, str>>, data: Option<Value>) -> Self {
         Self::new(ErrorCode::INVALID_PARAMS, message, data)
     }
-    pub fn internal_error(message: String, data: Option<Value>) -> Self {
+    pub fn internal_error(message: impl Into<Cow<'static, str>>, data: Option<Value>) -> Self {
         Self::new(ErrorCode::INTERNAL_ERROR, message, data)
     }
 }
@@ -298,8 +322,7 @@ impl<Req, Resp, Noti> Message<Req, Resp, Noti> {
 
 /// # Empty result
 /// A response that indicates success but carries no data.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
-pub struct EmptyResult {}
+pub type EmptyResult = EmptyObject;
 
 impl From<()> for EmptyResult {
     fn from(_value: ()) -> Self {
@@ -338,13 +361,13 @@ pub type InitializeRequest = Request<InitializeResultMethod, InitializeRequestPa
 
 const_string!(InitializedNotificationMethod = "notifications/initialized");
 /// This notification is sent from the client to the server after initialization has finished.
-pub type InitializedNotification = Notification<InitializedNotificationMethod, ()>;
+pub type InitializedNotification = NotificationNoParam<InitializedNotificationMethod>;
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeRequestParam {
     pub protocol_version: String,
     pub capabilities: ClientCapabilities,
-    pub server_info: Implementation,
+    pub client_info: Implementation,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -410,22 +433,26 @@ impl Implementation {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptsCapability {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub list_changed: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourcesCapability {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subscribe: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub list_changed: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolsCapability {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub list_changed: Option<bool>,
 }
 
@@ -437,7 +464,7 @@ pub struct PaginatedRequestParam {
 }
 
 const_string!(PingRequestMethod = "ping");
-pub type PingRequest = Request<PingRequestMethod, ()>;
+pub type PingRequest = RequestNoParam<PingRequestMethod>;
 
 const_string!(ProgressNotificationMethod = "notifications/progress");
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -494,7 +521,8 @@ pub struct ReadResourceResult {
 pub type ReadResourceRequest = Request<ReadResourceRequestMethod, ReadResourceRequestParam>;
 
 const_string!(ResourceListChangedNotificationMethod = "notifications/resources/list_changed");
-pub type ResourceListChangedNotification = Notification<ResourceListChangedNotificationMethod, ()>;
+pub type ResourceListChangedNotification =
+    NotificationNoParam<ResourceListChangedNotificationMethod>;
 
 const_string!(SubscribeRequestMethod = "resources/subscribe");
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -533,15 +561,15 @@ const_string!(GetPromptRequestMethod = "prompts/get");
 pub struct GetPromptRequestParam {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<BTreeMap<String, String>>,
+    pub arguments: Option<JsonObject>,
 }
 pub type GetPromptRequest = Request<GetPromptRequestMethod, GetPromptRequestParam>;
 
 const_string!(PromptListChangedNotificationMethod = "notifications/prompts/list_changed");
-pub type PromptListChangedNotification = Notification<PromptListChangedNotificationMethod, ()>;
+pub type PromptListChangedNotification = NotificationNoParam<PromptListChangedNotificationMethod>;
 
 const_string!(ToolListChangedNotificationMethod = "notifications/tools/list_changed");
-pub type ToolListChangedNotification = Notification<ToolListChangedNotificationMethod, ()>;
+pub type ToolListChangedNotification = NotificationNoParam<ToolListChangedNotificationMethod>;
 // 日志相关
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -684,7 +712,7 @@ pub struct Root {
 }
 
 const_string!(ListRootsRequestMethod = "roots/list");
-pub type ListRootsRequest = Request<ListRootsRequestMethod, ()>;
+pub type ListRootsRequest = RequestNoParam<ListRootsRequestMethod>;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -693,7 +721,7 @@ pub struct ListRootsResult {
 }
 
 const_string!(RootsListChangedNotificationMethod = "notifications/roots/list_changed");
-pub type RootsListChangedNotification = Notification<RootsListChangedNotificationMethod, ()>;
+pub type RootsListChangedNotification = NotificationNoParam<RootsListChangedNotificationMethod>;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -726,7 +754,7 @@ const_string!(CallToolRequestMethod = "tools/call");
 pub struct CallToolRequestParam {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<BTreeMap<String, Value>>,
+    pub arguments: Option<JsonObject>,
 }
 
 pub type CallToolRequest = Request<CallToolRequestMethod, CallToolRequestParam>;
@@ -794,8 +822,14 @@ ts_union!(
 );
 
 ts_union!(
-    export type ClientResult = EmptyResult | CreateMessageResult | ListRootsResult;
+    export type ClientResult = CreateMessageResult | ListRootsResult | EmptyResult;
 );
+
+impl ClientResult {
+    pub fn empty(_: ()) -> ClientResult {
+        ClientResult::EmptyResult(EmptyResult {})
+    }
+}
 
 pub type ClientJsonRpcMessage = JsonRpcMessage<ClientRequest, ClientResult, ClientNotification>;
 pub type ClientMessage = Message<ClientRequest, ClientResult, ClientNotification>;
@@ -820,7 +854,6 @@ ts_union!(
 
 ts_union!(
     export type ServerResult =
-    | EmptyResult
     | InitializeResult
     | CompleteResult
     | GetPromptResult
@@ -829,7 +862,9 @@ ts_union!(
     | ListResourceTemplatesResult
     | ReadResourceResult
     | CallToolResult
-    | ListToolsResult;
+    | ListToolsResult
+    | EmptyResult
+    ;
 );
 
 impl ServerResult {
@@ -888,5 +923,109 @@ mod tests {
         }
         let json = serde_json::to_value(&message).expect("valid json");
         assert_eq!(json, raw);
+    }
+
+    #[test]
+    fn test_initial_request_response_serde() {
+        let request = json!({
+          "jsonrpc": "2.0",
+          "id": 1,
+          "method": "initialize",
+          "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+              "roots": {
+                "listChanged": true
+              },
+              "sampling": {}
+            },
+            "clientInfo": {
+              "name": "ExampleClient",
+              "version": "1.0.0"
+            }
+          }
+        });
+        let raw_response_json = json!({
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+              "logging": {},
+              "prompts": {
+                "listChanged": true
+              },
+              "resources": {
+                "subscribe": true,
+                "listChanged": true
+              },
+              "tools": {
+                "listChanged": true
+              }
+            },
+            "serverInfo": {
+              "name": "ExampleServer",
+              "version": "1.0.0"
+            }
+          }
+        });
+        let request: ClientJsonRpcMessage =
+            serde_json::from_value(request.clone()).expect("invalid request");
+        let (request, id) = request
+            .into_message()
+            .into_request()
+            .expect("expect request");
+        assert_eq!(id, RequestId::Number(1));
+        match request {
+            ClientRequest::InitializeRequest(Request {
+                method: _,
+                params:
+                    InitializeRequestParam {
+                        protocol_version,
+                        capabilities,
+                        client_info,
+                    },
+            }) => {
+                assert_eq!(protocol_version, "2024-11-05");
+                assert_eq!(capabilities.roots.unwrap().list_changed, Some(true));
+                assert_eq!(capabilities.sampling.unwrap().len(), 0);
+                assert_eq!(client_info.name, "ExampleClient");
+                assert_eq!(client_info.version, "1.0.0");
+            }
+            _ => panic!("Expected InitializeRequest"),
+        }
+        let server_response: ServerJsonRpcMessage =
+            serde_json::from_value(raw_response_json.clone()).expect("invalid response");
+        let (response, id) = server_response
+            .clone()
+            .into_message()
+            .into_response()
+            .expect("expect response");
+        assert_eq!(id, RequestId::Number(1));
+        match response {
+            ServerResult::InitializeResult(InitializeResult {
+                protocol_version: _,
+                capabilities,
+                server_info,
+                instructions,
+            }) => {
+                assert_eq!(capabilities.logging.unwrap().len(), 0);
+                assert_eq!(capabilities.prompts.unwrap().list_changed, Some(true));
+                assert_eq!(
+                    capabilities.resources.as_ref().unwrap().subscribe,
+                    Some(true)
+                );
+                assert_eq!(capabilities.resources.unwrap().list_changed, Some(true));
+                assert_eq!(capabilities.tools.unwrap().list_changed, Some(true));
+                assert_eq!(server_info.name, "ExampleServer");
+                assert_eq!(server_info.version, "1.0.0");
+                assert_eq!(instructions, None);
+            }
+            other => panic!("Expected InitializeResult, got {other:?}"),
+        }
+
+        let server_response_json: Value = serde_json::to_value(&server_response).expect("msg");
+
+        assert_eq!(server_response_json, raw_response_json);
     }
 }

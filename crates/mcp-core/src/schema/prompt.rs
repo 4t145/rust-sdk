@@ -1,7 +1,6 @@
-use crate::content::{Annotations, EmbeddedResource, ImageContent};
-use crate::handler::PromptError;
-use crate::resource::ResourceContents;
-use base64::engine::{general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use super::content::{Annotations, EmbeddedResource, ImageContent};
+use super::resource::ResourceContents;
+use base64::engine::{Engine, general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 
 /// A prompt that can be used to generate text from a model
@@ -71,7 +70,7 @@ pub enum PromptMessageContent {
 }
 
 impl PromptMessageContent {
-    pub fn text(text: impl Into<String>) -> Self{
+    pub fn text(text: impl Into<String>) -> Self {
         Self::Text { text: text.into() }
     }
 }
@@ -99,19 +98,20 @@ impl PromptMessage {
         data: S,
         mime_type: S,
         annotations: Option<Annotations>,
-    ) -> Result<Self, PromptError> {
+    ) -> Result<Self, crate::error::Error> {
         let data = data.into();
         let mime_type = mime_type.into();
 
         // Validate base64 data
         BASE64_STANDARD.decode(&data).map_err(|_| {
-            PromptError::InvalidParameters("Image data must be valid base64".to_string())
+            crate::error::Error::invalid_params("Image data must be valid base64", None)
         })?;
 
         // Validate mime type
         if !mime_type.starts_with("image/") {
-            return Err(PromptError::InvalidParameters(
-                "MIME type must be a valid image type (e.g. image/jpeg)".to_string(),
+            return Err(crate::error::Error::invalid_params(
+                "MIME type must be a valid image type (e.g. image/jpeg)",
+                None,
             ));
         }
 

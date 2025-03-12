@@ -1,34 +1,31 @@
 use axum::{
-    body::Body,
+    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::sse::{Event, Sse},
     routing::get,
-    Router,
 };
-use futures::{stream::Stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, stream::Stream};
+use mcp_core::{schema::ClientJsonRpcMessage, transport::Transport};
+use mcp_server::{ServerHandlerService, serve};
 use std::collections::HashMap;
-use tokio_util::codec::FramedRead;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::{
-    io::{self, AsyncWriteExt},
-    sync::Mutex,
-};
+use tokio::io::{self};
 use tracing_subscriber::{self};
 mod common;
-use common::counter;
 
-type C2SWriter = Arc<Mutex<io::WriteHalf<io::SimplexStream>>>;
 type SessionId = Arc<str>;
 
 const BIND_ADDRESS: &str = "127.0.0.1:8000";
 
 #[derive(Clone, Default)]
 pub struct App {
-    txs: Arc<tokio::sync::RwLock<HashMap<SessionId, C2SWriter>>>,
+    txs: Arc<
+        tokio::sync::RwLock<HashMap<SessionId, tokio::sync::mpsc::Sender<ClientJsonRpcMessage>>>,
+    >,
 }
 
 impl App {
@@ -58,65 +55,44 @@ pub struct PostEventQuery {
 async fn post_event_handler(
     State(app): State<App>,
     Query(PostEventQuery { session_id }): Query<PostEventQuery>,
-    body: Body,
+    Json(message): Json<ClientJsonRpcMessage>,
 ) -> Result<StatusCode, StatusCode> {
-    const BODY_BYTES_LIMIT: usize = 1 << 22;
-    let write_stream = {
+    let tx = {
         let rg = app.txs.read().await;
         rg.get(session_id.as_str())
             .ok_or(StatusCode::NOT_FOUND)?
             .clone()
     };
-    let mut write_stream = write_stream.lock().await;
-    let mut body = body.into_data_stream();
-    if let (_, Some(size)) = body.size_hint() {
-        if size > BODY_BYTES_LIMIT {
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
-        }
+    if tx.send(message).await.is_err() {
+        tracing::error!("send message error");
+        return Err(StatusCode::GONE);
     }
-    // calculate the body size
-    let mut size = 0;
-    while let Some(chunk) = body.next().await {
-        let Ok(chunk) = chunk else {
-            return Err(StatusCode::BAD_REQUEST);
-        };
-        size += chunk.len();
-        if size > BODY_BYTES_LIMIT {
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
-        }
-        write_stream
-            .write_all(&chunk)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
-    write_stream
-        .write_u8(b'\n')
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::ACCEPTED)
 }
 
 async fn sse_handler(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, io::Error>>> {
     // it's 4KB
-    const BUFFER_SIZE: usize = 1 << 12;
     let session = session_id();
     tracing::info!(%session, "sse connection");
-    let (c2s_read, c2s_write) = tokio::io::simplex(BUFFER_SIZE);
-    let (s2c_read, s2c_write) = tokio::io::simplex(BUFFER_SIZE);
+    use tokio_stream::wrappers::ReceiverStream;
+    use tokio_util::sync::PollSender;
+    let (from_client_tx, from_client_rx) = tokio::sync::mpsc::channel(64);
+    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel(64);
     app.txs
         .write()
         .await
-        .insert(session.clone(), Arc::new(Mutex::new(c2s_write)));
+        .insert(session.clone(), from_client_tx);
     {
         let session = session.clone();
         tokio::spawn(async move {
-            let router = RouterService(counter::Counter::new());
-            let server = Server::new(router);
-            let bytes_transport = ByteTransport::new(c2s_read, s2c_write);
-            let _result = server
-                .run(bytes_transport)
+            let service = ServerHandlerService::new(common::counter::Counter::new());
+            let stream = ReceiverStream::new(from_client_rx);
+            let sink = PollSender::new(to_client_tx);
+            let _result = serve(service, Transport::new(sink, stream))
                 .await
-                .inspect_err(|e| tracing::error!(?e, "server run error"));
+                .inspect_err(|e| {
+                    tracing::error!("serving error: {:?}", e);
+                });
             app.txs.write().await.remove(&session);
         });
     }
@@ -126,14 +102,12 @@ async fn sse_handler(State(app): State<App>) -> Sse<impl Stream<Item = Result<Ev
             .event("endpoint")
             .data(format!("?sessionId={session}")),
     ))
-    .chain(
-        FramedRead::new(s2c_read, common::jsonrpc_frame_codec::JsonRpcFrameCodec)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            .and_then(move |bytes| match std::str::from_utf8(&bytes) {
-                Ok(message) => futures::future::ok(Event::default().event("message").data(message)),
-                Err(e) => futures::future::err(io::Error::new(io::ErrorKind::InvalidData, e)),
-            }),
-    );
+    .chain(ReceiverStream::new(to_client_rx).map(|message| {
+        match serde_json::to_string(&message) {
+            Ok(bytes) => Ok(Event::default().event("message").data(&bytes)),
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+        }
+    }));
     Sse::new(stream)
 }
 
