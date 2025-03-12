@@ -1,5 +1,5 @@
 /// Resources that servers provide to clients
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -54,6 +54,16 @@ pub enum ResourceContents {
         mime_type: Option<String>,
         blob: String,
     },
+}
+
+impl ResourceContents {
+    pub fn text(text: impl Into<String>, uri: impl Into<String>) -> Self {
+        Self::TextResourceContents {
+            uri: uri.into(),
+            mime_type: Some(default_mime_type()),
+            text: text.into(),
+        }
+    }
 }
 
 fn default_mime_type() -> String {

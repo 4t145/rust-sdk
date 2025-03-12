@@ -70,6 +70,12 @@ pub enum PromptMessageContent {
     Resource { resource: EmbeddedResource },
 }
 
+impl PromptMessageContent {
+    pub fn text(text: impl Into<String>) -> Self{
+        Self::Text { text: text.into() }
+    }
+}
+
 /// A message in a prompt conversation
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptMessage {

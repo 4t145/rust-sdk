@@ -16,7 +16,12 @@ anyhow = "1.0"
 chrono = { version = "0.4.38", features = ["serde"] }
 url = "2.5"
 base64 = "0.21"
-
+tower-service = "0.3"
+tokio = {version = "1", features = ["sync", "macros", "io-util"]}
+futures = "0.3"
+tracing = { version = "0.1"}
+tokio-util = { version = "0.7", features = ["io", "codec"]}
+pin-project-lite = "0.2"
 [features]
 default = ["default_json_schema"]
 default_json_schema = []

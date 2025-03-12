@@ -23,8 +23,8 @@ tokio-util = { version = "0.7", features = ["io", "codec"]}
 rand = { version = "0.8" }
 
 [[example]]
-name = "counter-server"
-path = "src/counter_server.rs"
+name = "tokio_std_io"
+path = "src/tokio_std_io.rs"
 
 [[example]]
 name = "axum"

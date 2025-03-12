@@ -1,10 +1,9 @@
 use anyhow::Result;
-use mcp_server::router::RouterService;
-use mcp_server::{ByteTransport, Server};
+use mcp_server::{ServerHandlerService, RoleServer, serve, };
 use tokio::io::{stdin, stdout};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{self, EnvFilter};
-
+use mcp_core::transport::tokio_io::{tokio_rw};
 mod common;
 
 #[tokio::main]
@@ -25,12 +24,10 @@ async fn main() -> Result<()> {
     tracing::info!("Starting MCP server");
 
     // Create an instance of our counter router
-    let router = RouterService(common::counter::CounterRouter::new());
-
-    // Create and run the server
-    let server = Server::new(router);
-    let transport = ByteTransport::new(stdin(), stdout());
-
+    let service = ServerHandlerService::new(common::counter::Counter::new());
+    let transport = tokio_rw(stdin(), stdout());
     tracing::info!("Server initialized and ready to handle requests");
-    Ok(server.run(transport).await?)
+    let transport = serve(service, transport).await;
+
+    Ok(())
 }

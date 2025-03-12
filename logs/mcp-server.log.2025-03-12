@@ -1,0 +1,18 @@
+[2m2025-03-12T10:39:56.408574Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m24:[0m Starting MCP server
+[2m2025-03-12T10:39:56.408657Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m29:[0m Server initialized and ready to handle requests
+[2m2025-03-12T10:39:56.408677Z[0m [32m INFO[0m ThreadId(01) [2mcrates/mcp-core/src/service.rs[0m[2m:[0m[2m185:[0m Server started
+[2m2025-03-12T10:41:01.407735Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m24:[0m Starting MCP server
+[2m2025-03-12T10:41:01.407837Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m29:[0m Server initialized and ready to handle requests
+[2m2025-03-12T10:41:01.407888Z[0m [32m INFO[0m ThreadId(01) [2mcrates/mcp-core/src/service.rs[0m[2m:[0m[2m185:[0m Server started
+[2m2025-03-12T10:41:26.058347Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m24:[0m Starting MCP server
+[2m2025-03-12T10:41:26.058410Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m29:[0m Server initialized and ready to handle requests
+[2m2025-03-12T10:41:26.058428Z[0m [32m INFO[0m ThreadId(01) [2mcrates/mcp-core/src/service.rs[0m[2m:[0m[2m185:[0m Server started
+[2m2025-03-12T10:41:36.563087Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m24:[0m Starting MCP server
+[2m2025-03-12T10:41:36.563153Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m29:[0m Server initialized and ready to handle requests
+[2m2025-03-12T10:41:36.563169Z[0m [32m INFO[0m ThreadId(01) [2mcrates/mcp-core/src/service.rs[0m[2m:[0m[2m185:[0m Server started
+[2m2025-03-12T10:41:51.216424Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m24:[0m Starting MCP server
+[2m2025-03-12T10:41:51.216495Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m29:[0m Server initialized and ready to handle requests
+[2m2025-03-12T10:41:51.216511Z[0m [32m INFO[0m ThreadId(01) [2mcrates/mcp-core/src/service.rs[0m[2m:[0m[2m185:[0m Server started
+[2m2025-03-12T10:42:01.302844Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m24:[0m Starting MCP server
+[2m2025-03-12T10:42:01.302941Z[0m [32m INFO[0m ThreadId(01) [2mexamples/servers/src/tokio_std_io.rs[0m[2m:[0m[2m29:[0m Server initialized and ready to handle requests
+[2m2025-03-12T10:42:01.302958Z[0m [32m INFO[0m ThreadId(01) [2mcrates/mcp-core/src/service.rs[0m[2m:[0m[2m185:[0m Server started

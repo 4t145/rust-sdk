@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Pointer};
 
 /// The protocol messages exchanged between client and server
 use crate::{
@@ -62,6 +62,15 @@ pub enum NumberOrString {
     String(String),
 }
 
+impl std::fmt::Display for NumberOrString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NumberOrString::Number(n) => n.fmt(f),
+            NumberOrString::String(s) => s.fmt(f),
+        }
+    }
+}
+
 impl Serialize for NumberOrString {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -91,8 +100,8 @@ impl<'de> Deserialize<'de> for NumberOrString {
     }
 }
 
-type RequestId = NumberOrString;
-type ProgressToken = NumberOrString;
+pub type RequestId = NumberOrString;
+pub type ProgressToken = NumberOrString;
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct WithMeta<P = JsonObject, M = ()> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,17 +116,16 @@ pub struct RequestMeta {
     progress_token: ProgressToken,
 }
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct Request<M = String, P = WithMeta<JsonObject, RequestMeta>> {
+pub struct Request<M = String, P = Option<WithMeta<JsonObject, RequestMeta>>> {
     pub method: M,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<P>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: P,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct Notification<M = String, P = WithMeta<JsonObject, JsonObject>> {
+pub struct Notification<M = String, P = Option<WithMeta<JsonObject, JsonObject>>> {
     pub method: M,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<P>,
+    pub params: P,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -152,7 +160,7 @@ pub struct JsonRpcNotification<N = Notification> {
 // Standard JSON-RPC error codes
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
-pub struct ErrorCode(i32);
+pub struct ErrorCode(pub i32);
 
 impl ErrorCode {
     pub const PARSE_ERROR: Self = Self(-32700);
@@ -180,7 +188,7 @@ pub struct ErrorData {
 impl ErrorData {
     pub fn new(code: ErrorCode, message: String, data: Option<Value>) -> Self {
         Self {
-            code, 
+            code,
             message,
             data,
         }
@@ -216,16 +224,14 @@ impl<Req, Resp, Noti> JsonRpcMessage<Req, Resp, Noti> {
         match self {
             JsonRpcMessage::Request(JsonRpcRequest { id, request, .. }) => {
                 Message::Request(request, id)
-            },
+            }
             JsonRpcMessage::Response(JsonRpcResponse { id, result, .. }) => {
                 Message::Response(result, id)
-            },
+            }
             JsonRpcMessage::Notification(JsonRpcNotification { notification, .. }) => {
                 Message::Notification(notification)
-            },
-            JsonRpcMessage::Error(JsonRpcError { id, error, .. }) => {
-                Message::Error(error, id)
-            },
+            }
+            JsonRpcMessage::Error(JsonRpcError { id, error, .. }) => Message::Error(error, id),
         }
     }
 }
@@ -239,43 +245,71 @@ pub enum Message<Req = Request, Resp = DefaultResponse, Noti = Notification> {
 }
 
 impl<Req, Resp, Noti> Message<Req, Resp, Noti> {
+    pub fn into_notification(self) -> Option<Noti> {
+        match self {
+            Message::Notification(notification) => Some(notification),
+            _ => None,
+        }
+    }
+    pub fn into_response(self) -> Option<(Resp, RequestId)> {
+        match self {
+            Message::Response(result, id) => Some((result, id)),
+            _ => None,
+        }
+    }
+    pub fn into_request(self) -> Option<(Req, RequestId)> {
+        match self {
+            Message::Request(request, id) => Some((request, id)),
+            _ => None,
+        }
+    }
+    pub fn into_error(self) -> Option<(ErrorData, RequestId)> {
+        match self {
+            Message::Error(error, id) => Some((error, id)),
+            _ => None,
+        }
+    }
     pub fn into_json_rpc_message(self) -> JsonRpcMessage<Req, Resp, Noti> {
         match self {
-            Message::Request(request, id) => {
-                JsonRpcMessage::Request(JsonRpcRequest {
-                    jsonrpc: JsonRpcVersion2_0,
-                    id,
-                    request,
-                })
-            },
-            Message::Response(result, id) => {
-                JsonRpcMessage::Response(JsonRpcResponse {
-                    jsonrpc: JsonRpcVersion2_0,
-                    id,
-                    result,
-                })
-            },
-            Message::Error(error, id) => {
-                JsonRpcMessage::Error(JsonRpcError {
-                    jsonrpc: JsonRpcVersion2_0,
-                    id,
-                    error,
-                })
-            },
+            Message::Request(request, id) => JsonRpcMessage::Request(JsonRpcRequest {
+                jsonrpc: JsonRpcVersion2_0,
+                id,
+                request,
+            }),
+            Message::Response(result, id) => JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: JsonRpcVersion2_0,
+                id,
+                result,
+            }),
+            Message::Error(error, id) => JsonRpcMessage::Error(JsonRpcError {
+                jsonrpc: JsonRpcVersion2_0,
+                id,
+                error,
+            }),
             Message::Notification(notification) => {
                 JsonRpcMessage::Notification(JsonRpcNotification {
                     jsonrpc: JsonRpcVersion2_0,
                     notification,
                 })
-            },
+            }
         }
     }
 }
 
 /// # Empty result
 /// A response that indicates success but carries no data.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct EmptyResult {}
+
+impl From<()> for EmptyResult {
+    fn from(_value: ()) -> Self {
+        EmptyResult {}
+    }
+}
+
+impl From<EmptyResult> for () {
+    fn from(_value: EmptyResult) {}
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -309,14 +343,14 @@ pub type InitializedNotification = Notification<InitializedNotificationMethod, (
 #[serde(rename_all = "camelCase")]
 pub struct InitializeRequestParam {
     pub protocol_version: String,
-    pub capabilities: ServerCapabilities,
+    pub capabilities: ClientCapabilities,
     pub server_info: Implementation,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
-    pub protocol_version: String,
+    pub protocol_version: LatestProtocolVersion,
     pub capabilities: ServerCapabilities,
     pub server_info: Implementation,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -340,7 +374,7 @@ pub struct ClientCapabilities {
     pub sampling: Option<JsonObject>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -359,6 +393,21 @@ pub struct ServerCapabilities {
 pub struct Implementation {
     pub name: String,
     pub version: String,
+}
+
+impl Default for Implementation {
+    fn default() -> Self {
+        Self::from_build_env()
+    }
+}
+
+impl Implementation {
+    pub fn from_build_env() -> Self {
+        Implementation {
+            name: env!("CARGO_CRATE_NAME").to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -399,7 +448,7 @@ pub struct ProgressNotificationParam {
     pub total: i32,
 }
 
-pub type ProgressNotification = Request<ProgressNotificationMethod, ProgressNotificationParam>;
+pub type ProgressNotification = Notification<ProgressNotificationMethod, ProgressNotificationParam>;
 
 pub type Cursor = String;
 
@@ -411,8 +460,8 @@ macro_rules! paginated_result {
         #[serde(rename_all = "camelCase")]
         pub struct $t {
             #[serde(skip_serializing_if = "Option::is_none")]
-            next_cursor: Option<Cursor>,
-            $i_item: $t_item,
+            pub next_cursor: Option<Cursor>,
+            pub $i_item: $t_item,
         }
     };
 }
@@ -439,7 +488,7 @@ pub struct ReadResourceRequestParam {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ReadResourceResult {
-    contents: Vec<ResourceContents>,
+    pub contents: Vec<ResourceContents>,
 }
 
 pub type ReadResourceRequest = Request<ReadResourceRequestMethod, ReadResourceRequestParam>;
@@ -577,7 +626,7 @@ pub struct ModelHint {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CompleteRequestParam {
-    pub ref_: Reference,
+    pub r#ref: Reference,
     pub argument: ArgumentInfo,
 }
 
@@ -652,6 +701,15 @@ pub struct CallToolResult {
     pub content: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+}
+
+impl CallToolResult {
+    pub fn success(content: Vec<Content>) -> Self {
+        CallToolResult {
+            content,
+            is_error: Some(false),
+        }
+    }
 }
 
 const_string!(ListToolsRequestMethod = "tools/list");
@@ -739,7 +797,6 @@ ts_union!(
     export type ClientResult = EmptyResult | CreateMessageResult | ListRootsResult;
 );
 
-
 pub type ClientJsonRpcMessage = JsonRpcMessage<ClientRequest, ClientResult, ClientNotification>;
 pub type ClientMessage = Message<ClientRequest, ClientResult, ClientNotification>;
 
@@ -761,7 +818,6 @@ ts_union!(
     | PromptListChangedNotification;
 );
 
-
 ts_union!(
     export type ServerResult =
     | EmptyResult
@@ -776,8 +832,14 @@ ts_union!(
     | ListToolsResult;
 );
 
+impl ServerResult {
+    pub fn empty(_: ()) -> ServerResult {
+        ServerResult::EmptyResult(EmptyResult {})
+    }
+}
+
 pub type ServerJsonRpcMessage = JsonRpcMessage<ServerRequest, ServerResult, ServerNotification>;
-pub type ServerMessage = Message<ClientRequest, ClientResult, ClientNotification>;
+pub type ServerMessage = Message<ServerRequest, ServerResult, ServerNotification>;
 
 #[cfg(test)]
 mod tests {
@@ -790,12 +852,11 @@ mod tests {
             "jsonrpc": JsonRpcVersion2_0,
             "method": InitializedNotificationMethod,
         });
-        let message: ClientJsonRpcMessage = serde_json::from_value(raw.clone()).expect("invalid notification");
+        let message: ClientJsonRpcMessage =
+            serde_json::from_value(raw.clone()).expect("invalid notification");
         let message = message.into_message();
         match &message {
-            ClientMessage::Notification(ClientNotification::InitializedNotification(_n)) => {
-
-            }
+            ClientMessage::Notification(ClientNotification::InitializedNotification(_n)) => {}
             _ => panic!("Expected Notification"),
         }
         let json = serde_json::to_value(message.into_json_rpc_message()).expect("valid json");
