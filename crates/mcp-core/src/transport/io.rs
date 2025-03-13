@@ -12,7 +12,7 @@ use tokio_util::{
 
 use super::Transport;
 
-pub fn tokio_rw<I, O, R, W>(
+pub fn async_rw<I, O, R, W>(
     read: R,
     write: W,
 ) -> impl Sink<O, Error = std::io::Error> + Stream<Item = I>

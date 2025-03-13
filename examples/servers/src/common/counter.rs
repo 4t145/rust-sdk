@@ -99,11 +99,8 @@ impl Counter {
 }
 
 impl ServerHandler for Counter {
-    async fn initialize(
-        &self,
-        _request: mcp_core::schema::InitializeRequestParam,
-    ) -> Result<mcp_core::schema::InitializeResult, mcp_core::error::Error> {
-        Ok(mcp_core::schema::InitializeResult {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
             protocol_version: mcp_core::schema::LatestProtocolVersion,
             capabilities: ServerCapabilities {
                 experimental: None,
@@ -116,7 +113,7 @@ impl ServerHandler for Counter {
             },
             server_info: Implementation::from_build_env(),
             instructions: Some("This server provides a counter tool that can increment and decrement values. The counter starts at 0 and can be modified using the 'increment' and 'decrement' tools. Use 'get_value' to check the current count.".to_string()),
-        })
+        }
     }
     async fn list_tools(
         &self,

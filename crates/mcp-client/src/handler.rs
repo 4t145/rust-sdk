@@ -1,114 +1,6 @@
 use mcp_core::error::Error as McpError;
 use mcp_core::schema::*;
-use mcp_core::service::{PeerProxy, RoleClient, Service, ServiceError};
-
-macro_rules! method {
-    (proxy_req $method:ident $Req:ident($Param: ident) => $Resp: ident ) => {
-        fn $method(
-            &self,
-            params: $Param,
-        ) -> impl Future<Output = Result<$Resp, ServiceError>> + Send + '_
-        where
-            Self: Sync,
-        {
-            async move {
-                let Some(proxy) = self.get_peer_proxy() else {
-                    return Err(ServiceError::Transport(std::io::Error::other(
-                        "peer proxy not initialized",
-                    )));
-                };
-                let result = proxy
-                    .send_request(ClientRequest::$Req($Req {
-                        method: Default::default(),
-                        params,
-                    }))
-                    .await?;
-                match result {
-                    ServerResult::$Resp(result) => Ok(result),
-                    _ => Err(ServiceError::UnexpectedResponse),
-                }
-            }
-        }
-    };
-    (proxy_req $method:ident $Req:ident($Param: ident)) => {
-        fn $method(
-            &self,
-            params: $Param,
-        ) -> impl Future<Output = Result<(), ServiceError>> + Send + '_
-        where
-            Self: Sync,
-        {
-            async move {
-                let Some(proxy) = self.get_peer_proxy() else {
-                    return Err(ServiceError::Transport(std::io::Error::other(
-                        "peer proxy not initialized",
-                    )));
-                };
-                let result = proxy
-                    .send_request(ClientRequest::$Req($Req {
-                        method: Default::default(),
-                        params,
-                    }))
-                    .await?;
-                match result {
-                    ServerResult::EmptyResult(_) => Ok(()),
-                    _ => Err(ServiceError::UnexpectedResponse),
-                }
-            }
-        }
-    };
-
-    (proxy_not $method:ident $Not:ident($Param: ident)) => {
-        fn $method(
-            &self,
-            params: $Param,
-        ) -> impl Future<Output = Result<(), ServiceError>> + Send + '_
-        where
-            Self: Sync,
-        {
-            async move {
-                let Some(proxy) = self.get_peer_proxy() else {
-                    return Err(ServiceError::Transport(std::io::Error::other(
-                        "peer proxy not initialized",
-                    )));
-                };
-                proxy
-                    .send_notification(ClientNotification::$Not(
-                        $Not {
-                            method: Default::default(),
-                            params,
-                        },
-                    ))
-                    .await?;
-                Ok(())
-            }
-        }
-    };
-    (proxy_not $method:ident $Not:ident) => {
-        fn $method(
-            &self,
-        ) -> impl Future<Output = Result<(), ServiceError>> + Send + '_
-        where
-            Self: Sync,
-        {
-            async move {
-                let Some(proxy) = self.get_peer_proxy() else {
-                    return Err(ServiceError::Transport(std::io::Error::other(
-                        "peer proxy not initialized",
-                    )));
-                };
-                proxy
-                    .send_notification(ClientNotification::$Not(
-                        $Not {
-                            method: Default::default(),
-                        },
-                    ))
-                    .await?;
-                Ok(())
-            }
-        }
-    };
-}
+use mcp_core::service::{Peer, RoleClient, Service, ServiceError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ClientHandlerService<H> {
@@ -128,7 +20,7 @@ impl<H: ClientHandler> Service for ClientHandlerService<H> {
         &self,
         request: <Self::Role as mcp_core::service::ServiceRole>::PeerReq,
     ) -> Result<<Self::Role as mcp_core::service::ServiceRole>::Resp, McpError> {
-        let result = match request {
+        match request {
             ServerRequest::PingRequest(_) => self.handler.ping().await.map(ClientResult::empty),
             ServerRequest::CreateMessageRequest(request) => self
                 .handler
@@ -140,8 +32,7 @@ impl<H: ClientHandler> Service for ClientHandlerService<H> {
                 .list_roots()
                 .await
                 .map(ClientResult::ListRootsResult),
-        };
-        result
+        }
     }
 
     async fn handle_notification(
@@ -174,17 +65,29 @@ impl<H: ClientHandler> Service for ClientHandlerService<H> {
         Ok(())
     }
 
-    fn get_peer_proxy(&self) -> Option<PeerProxy<Self::Role>> {
-        self.handler.get_peer_proxy()
+    fn get_peer(&self) -> Option<Peer<Self::Role>> {
+        self.handler.get_peer()
     }
 
-    fn set_peer_proxy(&mut self, peer: PeerProxy<Self::Role>) {
-        self.handler.set_peer_proxy(peer);
+    fn set_peer(&mut self, peer: Peer<Self::Role>) {
+        self.handler.set_peer(peer);
+    }
+    
+    fn set_peer_info(&mut self, peer: <Self::Role as mcp_core::service::ServiceRole>::PeerInfo) {
+        self.handler.set_peer_info(peer);
+    }
+    
+    fn get_peer_info(&self) -> Option<<Self::Role as mcp_core::service::ServiceRole>::PeerInfo> {
+        self.handler.get_peer_info()
+    }
+    
+    fn get_info(&self) -> <Self::Role as mcp_core::service::ServiceRole>::Info {
+        self.handler.get_info()
     }
 }
 
 #[allow(unused_variables)]
-pub trait ClientHandler: Sized + Send {
+pub trait ClientHandler: Sized + Send + Sync + 'static {
     fn ping(&self) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
         std::future::ready(Ok(()))
     }
@@ -235,42 +138,38 @@ pub trait ClientHandler: Sized + Send {
         std::future::ready(())
     }
 
-    fn initialize(
-        &self,
-        params: InitializeRequestParam,
-    ) -> impl Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
-        std::future::ready(Ok(InitializeResult {
-            protocol_version: LatestProtocolVersion,
-            capabilities: ServerCapabilities::default(),
-            server_info: Implementation::from_build_env(),
-            instructions: None,
-        }))
+    // method!(proxy_req initialize InitializeRequest(InitializeRequestParam) => InitializeResult);
+    // method!(proxy_req request_complete CompleteRequest(CompleteRequestParam) => CompleteResult);
+    // method!(proxy_req request_set_level SetLevelRequest(SetLevelRequestParam));
+    // method!(proxy_req request_get_prompt GetPromptRequest(GetPromptRequestParam) => GetPromptResult);
+    // method!(proxy_req request_list_prompts ListPromptsRequest(PaginatedRequestParam) => ListPromptsResult);
+    // method!(proxy_req request_list_resources ListResourcesRequest(PaginatedRequestParam) => ListResourcesResult);
+    // method!(proxy_req request_list_resource_templates ListResourceTemplatesRequest(PaginatedRequestParam) => ListResourceTemplatesResult);
+    // method!(proxy_req request_read_resource ReadResourceRequest(ReadResourceRequestParam) => ReadResourceResult);
+    // method!(proxy_req request_subscribe SubscribeRequest(SubscribeRequestParam) );
+    // method!(proxy_req request_unsubscribe UnsubscribeRequest(UnsubscribeRequestParam));
+    // method!(proxy_req request_call_tool CallToolRequest(CallToolRequestParam) => CallToolResult);
+    // method!(proxy_req request_list_tools ListToolsRequest(PaginatedRequestParam) => ListToolsResult);
+
+    // method!(proxy_not notify_cancelled CancelledNotification(CancelledNotificationParam));
+    // method!(proxy_not notify_progress ProgressNotification(ProgressNotificationParam));
+    // method!(proxy_not notify_initialized InitializedNotification);
+    // method!(proxy_not notify_roots_list_changed RootsListChangedNotification);
+
+
+    fn get_peer(&self) -> Option<Peer<RoleClient>>;
+
+    fn set_peer(&mut self, peer: Peer<RoleClient>);
+
+    fn set_peer_info(&mut self, peer: ServerInfo) {
+        drop(peer);
     }
-
-
-    method!(proxy_req request_complete CompleteRequest(CompleteRequestParam) => CompleteResult);
-    method!(proxy_req request_set_level SetLevelRequest(SetLevelRequestParam));
-    method!(proxy_req request_get_prompt GetPromptRequest(GetPromptRequestParam) => GetPromptResult);
-    method!(proxy_req request_list_prompts ListPromptsRequest(PaginatedRequestParam) => ListPromptsResult);
-    method!(proxy_req request_list_resources ListResourcesRequest(PaginatedRequestParam) => ListResourcesResult);
-    method!(proxy_req request_list_resource_templates ListResourceTemplatesRequest(PaginatedRequestParam) => ListResourceTemplatesResult);
-    method!(proxy_req request_read_resource ReadResourceRequest(ReadResourceRequestParam) => ReadResourceResult);
-    method!(proxy_req request_subscribe SubscribeRequest(SubscribeRequestParam) );
-    method!(proxy_req request_unsubscribe UnsubscribeRequest(UnsubscribeRequestParam));
-    method!(proxy_req request_call_tool CallToolRequest(CallToolRequestParam) => CallToolResult);
-    method!(proxy_req request_list_tools ListToolsRequest(PaginatedRequestParam) => ListToolsResult);
-
-    method!(proxy_not notify_cancelled CancelledNotification(CancelledNotificationParam));
-    method!(proxy_not notify_progress ProgressNotification(ProgressNotificationParam));
-    method!(proxy_not notify_initialized InitializedNotification);
-    method!(proxy_not notify_roots_list_changed RootsListChangedNotification);
-
-
-    fn get_peer_proxy(&self) -> Option<PeerProxy<RoleClient>> {
+    
+    fn get_peer_info(&self) -> Option<ServerInfo> {
         None
     }
-
-    fn set_peer_proxy(&mut self, peer: PeerProxy<RoleClient>) {
-        drop(peer);
+    
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::default()
     }
 }

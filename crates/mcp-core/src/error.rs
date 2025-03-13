@@ -13,3 +13,7 @@ impl Display for ErrorData {
         Ok(())
     }
 }
+
+impl std::error::Error for ErrorData {
+
+}

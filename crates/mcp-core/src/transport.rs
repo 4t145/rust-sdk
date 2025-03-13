@@ -1,7 +1,6 @@
 use futures::{Sink, Stream};
 #[cfg(feature = "tokio_io")]
-pub mod tokio_io;
-pub mod tokio_channel;
+pub mod io;
 
 
 pin_project_lite::pin_project! {

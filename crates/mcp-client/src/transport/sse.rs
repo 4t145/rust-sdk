@@ -1,306 +1,150 @@
-use crate::transport::{Error, PendingRequests, TransportMessage};
-use eventsource_client::{Client, SSE};
-use futures::TryStreamExt;
-use mcp_core::schema::{JsonRpcMessage, JsonRpcRequest};
-use reqwest::Client as HttpClient;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::{timeout, Duration};
-use tracing::warn;
-use url::Url;
+use eventsource_client::{
+    BoxStream, Client as EventSourceClient, ClientBuilder, Error as SseError, SSE,
+};
+use futures::{FutureExt, Sink, Stream, StreamExt};
+use mcp_core::schema::{ClientJsonRpcMessage, ServerJsonRpcMessage};
+use reqwest::{Client as HttpClient, header::HeaderMap};
+use std::{collections::VecDeque, sync::Arc};
+use thiserror::Error;
 
-use super::{send_message, Transport, TransportHandle};
-
-// Timeout for the endpoint discovery
-const ENDPOINT_TIMEOUT_SECS: u64 = 5;
-
-/// The SSE-based actor that continuously:
-/// - Reads incoming events from the SSE stream.
-/// - Sends outgoing messages via HTTP POST (once the post endpoint is known).
-pub struct SseActor {
-    /// Receives messages (requests/notifications) from the handle
-    receiver: mpsc::Receiver<TransportMessage>,
-    /// Map of request-id -> oneshot sender
-    pending_requests: Arc<PendingRequests>,
-    /// Base SSE URL
-    sse_url: String,
-    /// For sending HTTP POST requests
+#[derive(Error, Debug)]
+pub enum SseTransportError {
+    #[error("SSE error: {0}")]
+    Sse(#[from] SseError),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Reqwest error: {0}")]
+    Reqwest(#[from] reqwest::Error),
+    #[error("unexpected end of stream")]
+    UnexpectedEndOfStream,
+}
+pub struct SseTransport {
     http_client: HttpClient,
-    /// The discovered endpoint for POST requests (once "endpoint" SSE event arrives)
-    post_endpoint: Arc<RwLock<Option<String>>>,
+    event_source: BoxStream<Result<SSE, SseError>>,
+    post_url: Arc<str>,
+    _sse_url: Arc<str>,
+    #[allow(clippy::type_complexity)]
+    request_queue: VecDeque<tokio::sync::oneshot::Receiver<Result<(), SseTransportError>>>,
 }
 
-impl SseActor {
-    pub fn new(
-        receiver: mpsc::Receiver<TransportMessage>,
-        pending_requests: Arc<PendingRequests>,
-        sse_url: String,
-        post_endpoint: Arc<RwLock<Option<String>>>,
-    ) -> Self {
-        Self {
-            receiver,
-            pending_requests,
-            sse_url,
-            post_endpoint,
-            http_client: HttpClient::new(),
+impl SseTransport {
+    pub async fn start(url: &str, headers: HeaderMap) -> Result<Self, SseTransportError> {
+        let mut sse_client_builder = ClientBuilder::for_url(url)?;
+        for (name, value) in &headers {
+            if let Ok(value) = std::str::from_utf8(value.as_bytes()) {
+                sse_client_builder = sse_client_builder.header(name.as_str(), value)?;
+            }
         }
-    }
-
-    /// The main entry point for the actor. Spawns two concurrent loops:
-    /// 1) handle_incoming_messages (SSE events)
-    /// 2) handle_outgoing_messages (sending messages via POST)
-    pub async fn run(self) {
-        tokio::join!(
-            Self::handle_incoming_messages(
-                self.sse_url.clone(),
-                Arc::clone(&self.pending_requests),
-                Arc::clone(&self.post_endpoint)
-            ),
-            Self::handle_outgoing_messages(
-                self.receiver,
-                self.http_client.clone(),
-                Arc::clone(&self.post_endpoint),
-                Arc::clone(&self.pending_requests),
-            )
-        );
-    }
-
-    /// Continuously reads SSE events from `sse_url`.
-    /// - If an `endpoint` event is received, store it in `post_endpoint`.
-    /// - If a `message` event is received, parse it as `JsonRpcMessage`
-    ///   and respond to pending requests if it's a `Response`.
-    async fn handle_incoming_messages(
-        sse_url: String,
-        pending_requests: Arc<PendingRequests>,
-        post_endpoint: Arc<RwLock<Option<String>>>,
-    ) {
-        let client = match eventsource_client::ClientBuilder::for_url(&sse_url) {
-            Ok(builder) => builder.build(),
-            Err(e) => {
-                pending_requests.clear().await;
-                warn!("Failed to connect SSE client: {}", e);
-                return;
+        let client = sse_client_builder.build();
+        let mut event_stream = client.stream();
+        let first_event = loop {
+            let next_event = event_stream
+                .next()
+                .await
+                .ok_or(SseTransportError::UnexpectedEndOfStream)??;
+            match next_event {
+                SSE::Event(event) => {
+                    break event;
+                }
+                SSE::Comment(_) => continue,
             }
         };
-        let mut stream = client.stream();
+        let post_uri = format!("{}{}", url, first_event.data);
+        let sse_uri = url.to_string();
+        Ok(SseTransport {
+            http_client: HttpClient::builder().default_headers(headers).build()?,
+            event_source: event_stream,
+            post_url: Arc::from(post_uri),
+            _sse_url: Arc::from(sse_uri),
+            request_queue: Default::default(),
+        })
+    }
+}
 
-        // First, wait for the "endpoint" event
-        while let Ok(Some(event)) = stream.try_next().await {
-            match event {
-                SSE::Event(e) if e.event_type == "endpoint" => {
-                    // SSE server uses the "endpoint" event to tell us the POST URL
-                    let base_url = Url::parse(&sse_url).expect("Invalid base URL");
-                    let post_url = base_url
-                        .join(&e.data)
-                        .expect("Failed to resolve endpoint URL");
+impl Stream for SseTransport {
+    type Item = ServerJsonRpcMessage;
 
-                    tracing::debug!("Discovered SSE POST endpoint: {}", post_url);
-                    *post_endpoint.write().await = Some(post_url.to_string());
-                    break;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let event = std::task::ready!(self.event_source.poll_next_unpin(cx));
+        match event {
+            Some(Ok(SSE::Event(event))) => match serde_json::from_str(&event.data) {
+                Ok(message) => std::task::Poll::Ready(Some(message)),
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to parse json rpc request");
+                    self.poll_next(cx)
                 }
-                _ => continue,
+            },
+            Some(Ok(SSE::Comment(_))) => self.poll_next(cx),
+            Some(Err(e)) => {
+                tracing::error!(error = %e, "sse event stream encounter an error");
+                std::task::Poll::Ready(None)
             }
+            None => std::task::Poll::Ready(None),
         }
+    }
+}
 
-        // Now handle subsequent events
-        while let Ok(Some(event)) = stream.try_next().await {
-            match event {
-                SSE::Event(e) if e.event_type == "message" => {
-                    // Attempt to parse the SSE data as a JsonRpcMessage
-                    match serde_json::from_str::<JsonRpcMessage>(&e.data) {
-                        Ok(message) => {
-                            match &message {
-                                JsonRpcMessage::Response(response) => {
-                                    if let Some(id) = &response.id {
-                                        pending_requests
-                                            .respond(&id.to_string(), Ok(message))
-                                            .await;
-                                    }
-                                }
-                                JsonRpcMessage::Error(error) => {
-                                    if let Some(id) = &error.id {
-                                        pending_requests
-                                            .respond(&id.to_string(), Ok(message))
-                                            .await;
-                                    }
-                                }
-                                _ => {} // TODO: Handle other variants (Request, etc.)
-                            }
-                        }
-                        Err(err) => {
-                            warn!("Failed to parse SSE message: {err}");
-                        }
-                    }
-                }
-                _ => { /* ignore other events */ }
-            }
+impl Sink<ClientJsonRpcMessage> for SseTransport {
+    type Error = SseTransportError;
+
+    fn poll_ready(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        const QUEUE_SIZE: usize = 16;
+        if self.request_queue.len() >= QUEUE_SIZE {
+            std::task::ready!(
+                self.request_queue
+                    .front_mut()
+                    .expect("queue is not empty")
+                    .poll_unpin(cx)
+            )
+            .expect("sender shall not drop")?;
         }
-
-        // SSE stream ended or errored; signal any pending requests
-        tracing::error!("SSE stream ended or encountered an error; clearing pending requests.");
-        pending_requests.clear().await;
+        std::task::Poll::Ready(Ok(()))
     }
 
-    /// Continuously receives messages from the `mpsc::Receiver`.
-    /// - If it's a request, store the oneshot in `pending_requests`.
-    /// - POST the message to the discovered endpoint (once known).
-    async fn handle_outgoing_messages(
-        mut receiver: mpsc::Receiver<TransportMessage>,
-        http_client: HttpClient,
-        post_endpoint: Arc<RwLock<Option<String>>>,
-        pending_requests: Arc<PendingRequests>,
-    ) {
-        while let Some(transport_msg) = receiver.recv().await {
-            let post_url = match post_endpoint.read().await.as_ref() {
-                Some(url) => url.clone(),
-                None => {
-                    if let Some(response_tx) = transport_msg.response_tx {
-                        let _ = response_tx.send(Err(Error::NotConnected));
-                    }
-                    continue;
-                }
-            };
-
-            // Serialize the JSON-RPC message
-            let message_str = match serde_json::to_string(&transport_msg.message) {
-                Ok(s) => s,
-                Err(e) => {
-                    if let Some(tx) = transport_msg.response_tx {
-                        let _ = tx.send(Err(Error::Serialization(e)));
-                    }
-                    continue;
-                }
-            };
-
-            // If it's a request, store the channel so we can respond later
-            if let Some(response_tx) = transport_msg.response_tx {
-                if let JsonRpcMessage::Request(JsonRpcRequest { id: Some(id), .. }) =
-                    &transport_msg.message
-                {
-                    pending_requests.insert(id.to_string(), response_tx).await;
-                }
-            }
-
-            // Perform the HTTP POST
-            match http_client
-                .post(&post_url)
-                .header("Content-Type", "application/json")
-                .body(message_str)
+    fn start_send(
+        mut self: std::pin::Pin<&mut Self>,
+        item: ClientJsonRpcMessage,
+    ) -> Result<(), Self::Error> {
+        let client = self.http_client.clone();
+        let uri = self.post_url.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = client
+                .post(uri.as_ref())
+                .json(&item)
                 .send()
                 .await
-            {
-                Ok(resp) => {
-                    if !resp.status().is_success() {
-                        let err = Error::HttpError {
-                            status: resp.status().as_u16(),
-                            message: resp.status().to_string(),
-                        };
-                        warn!("HTTP request returned error: {err}");
-                        // This doesn't directly fail the request,
-                        // because we rely on SSE to deliver the error response
-                    }
-                }
-                Err(e) => {
-                    warn!("HTTP POST failed: {e}");
-                    // Similarly, SSE might eventually reveal the error
-                }
-            }
-        }
-
-        // mpsc channel closed => no more outgoing messages
-        tracing::error!("SseActor: outgoing message loop ended. Clearing pending requests.");
-        pending_requests.clear().await;
-    }
-}
-
-#[derive(Clone)]
-pub struct SseTransportHandle {
-    sender: mpsc::Sender<TransportMessage>,
-}
-
-impl TransportHandle for SseTransportHandle {
-    async fn send(&self, message: JsonRpcMessage) -> Result<JsonRpcMessage, Error> {
-        send_message(&self.sender, message).await
-    }
-}
-
-#[derive(Clone)]
-pub struct SseTransport {
-    sse_url: String,
-    env: HashMap<String, String>,
-}
-
-/// The SSE transport spawns an `SseActor` on `start()`.
-impl SseTransport {
-    pub fn new<S: Into<String>>(sse_url: S, env: HashMap<String, String>) -> Self {
-        Self {
-            sse_url: sse_url.into(),
-            env,
-        }
-    }
-
-    /// Waits for the endpoint to be set, up to 10 attempts.
-    async fn wait_for_endpoint(
-        post_endpoint: Arc<RwLock<Option<String>>>,
-    ) -> Result<String, Error> {
-        // Check every 100ms for the endpoint, for up to 10 attempts
-        let check_interval = Duration::from_millis(100);
-        let mut attempts = 0;
-        let max_attempts = 10;
-
-        while attempts < max_attempts {
-            if let Some(url) = post_endpoint.read().await.clone() {
-                return Ok(url);
-            }
-            tokio::time::sleep(check_interval).await;
-            attempts += 1;
-        }
-        Err(Error::SseConnection("No endpoint discovered".to_string()))
-    }
-}
-
-impl Transport for SseTransport {
-    type Handle = SseTransportHandle;
-
-    async fn start(&self) -> Result<Self::Handle, Error> {
-        // Set environment variables
-        for (key, value) in &self.env {
-            unsafe { std::env::set_var(key, value) };
-        }
-
-        // Create a channel for outgoing TransportMessages
-        let (tx, rx) = mpsc::channel(32);
-
-        let post_endpoint: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
-        let post_endpoint_clone = Arc::clone(&post_endpoint);
-
-        // Build the actor
-        let actor = SseActor::new(
-            rx,
-            Arc::new(PendingRequests::new()),
-            self.sse_url.clone(),
-            post_endpoint,
-        );
-
-        // Spawn the actor task
-        tokio::spawn(actor.run());
-
-        // Wait for the endpoint to be discovered before returning the handle
-        match timeout(
-            Duration::from_secs(ENDPOINT_TIMEOUT_SECS),
-            Self::wait_for_endpoint(post_endpoint_clone),
-        )
-        .await
-        {
-            Ok(_) => Ok(SseTransportHandle { sender: tx }),
-            Err(e) => Err(Error::SseConnection(e.to_string())),
-        }
-    }
-
-    async fn close(&self) -> Result<(), Error> {
-        // For SSE, you might close the stream or send a shutdown signal to the actor.
-        // Here, we do nothing special.
+                .and_then(|resp| resp.error_for_status())
+                .map_err(SseTransportError::from)
+                .map(drop);
+            let _ = tx.send(result);
+        });
+        self.as_mut().request_queue.push_back(rx);
         Ok(())
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        let queue = &mut self.as_mut().request_queue;
+        while let Some(fut) = queue.front_mut() {
+            std::task::ready!(fut.poll_unpin(cx)).expect("sender shall not drop")?;
+            queue.pop_front();
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.poll_flush(cx)
     }
 }

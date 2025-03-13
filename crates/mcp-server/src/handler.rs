@@ -1,6 +1,6 @@
 use mcp_core::error::Error as McpError;
 use mcp_core::schema::*;
-use mcp_core::service::{PeerProxy, RoleServer, Service, ServiceError};
+use mcp_core::service::{Peer, RoleServer, Service, ServiceError, ServiceRole};
 
 pub mod tool;
 
@@ -11,9 +11,9 @@ macro_rules! method {
             Self: Sync,
         {
             async move {
-                let Some(proxy) = self.get_peer_proxy() else {
+                let Some(proxy) = self.get_peer_sink() else {
                     return Err(ServiceError::Transport(std::io::Error::other(
-                        "peer proxy not initialized",
+                        "peer sink not initialized",
                     )));
                 };
                 let result = proxy
@@ -37,7 +37,7 @@ macro_rules! method {
             Self: Sync,
         {
             async move {
-                let Some(proxy) = self.get_peer_proxy() else {
+                let Some(proxy) = self.get_peer_sink() else {
                     return Err(ServiceError::Transport(std::io::Error::other(
                         "peer proxy not initialized",
                     )));
@@ -92,7 +92,7 @@ macro_rules! method {
             Self: Sync,
         {
             async move {
-                let Some(proxy) = self.get_peer_proxy() else {
+                let Some(proxy) = self.get_peer_sink() else {
                     return Err(ServiceError::Transport(std::io::Error::other(
                         "peer proxy not initialized",
                     )));
@@ -113,9 +113,9 @@ macro_rules! method {
             Self: Sync,
         {
             async move {
-                let Some(proxy) = self.get_peer_proxy() else {
+                let Some(proxy) = self.get_peer_sink() else {
                     return Err(ServiceError::Transport(std::io::Error::other(
-                        "peer proxy not initialized",
+                        "peer sink not initialized",
                     )));
                 };
                 proxy
@@ -147,14 +147,14 @@ impl<H: ServerHandler> Service for ServerHandlerService<H> {
         request: <Self::Role as mcp_core::service::ServiceRole>::PeerReq,
     ) -> Result<<Self::Role as mcp_core::service::ServiceRole>::Resp, McpError> {
         match request {
-            ClientRequest::PingRequest(_request) => {
-                self.handler.ping().await.map(ServerResult::empty)
-            }
             ClientRequest::InitializeRequest(request) => self
                 .handler
                 .initialize(request.params)
                 .await
                 .map(ServerResult::InitializeResult),
+            ClientRequest::PingRequest(_request) => {
+                self.handler.ping().await.map(ServerResult::empty)
+            }
             ClientRequest::CompleteRequest(request) => self
                 .handler
                 .complete(request.params)
@@ -234,17 +234,29 @@ impl<H: ServerHandler> Service for ServerHandlerService<H> {
         Ok(())
     }
 
-    fn get_peer_proxy(&self) -> Option<PeerProxy<Self::Role>> {
-        self.handler.get_peer_proxy()
+    fn get_peer(&self) -> Option<Peer<Self::Role>> {
+        self.handler.get_peer_sink()
     }
 
-    fn set_peer_proxy(&mut self, peer: PeerProxy<Self::Role>) {
-        self.handler.set_peer_proxy(peer);
+    fn set_peer(&mut self, peer: Peer<Self::Role>) {
+        self.handler.set_peer_sink(peer);
+    }
+
+    fn set_peer_info(&mut self, peer: <Self::Role as mcp_core::service::ServiceRole>::PeerInfo) {
+        self.handler.set_peer_info(peer);
+    }
+
+    fn get_peer_info(&self) -> Option<<Self::Role as mcp_core::service::ServiceRole>::PeerInfo> {
+        self.handler.get_peer_info()
+    }
+
+    fn get_info(&self) -> <Self::Role as mcp_core::service::ServiceRole>::Info {
+        self.handler.get_info()
     }
 }
 
 #[allow(unused_variables)]
-pub trait ServerHandler: Sized + Send {
+pub trait ServerHandler: Sized + Clone + Send + Sync + 'static {
     fn ping(&self) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
         std::future::ready(Ok(()))
     }
@@ -253,12 +265,7 @@ pub trait ServerHandler: Sized + Send {
         &self,
         request: InitializeRequestParam,
     ) -> impl Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
-        std::future::ready(Ok(InitializeResult {
-            protocol_version: LatestProtocolVersion,
-            capabilities: ServerCapabilities::default(),
-            server_info: Implementation::from_build_env(),
-            instructions: None,
-        }))
+        std::future::ready(Ok(self.get_info()))
     }
     fn complete(
         &self,
@@ -364,11 +371,23 @@ pub trait ServerHandler: Sized + Send {
     method!(proxy_not notify_tool_list_changed ToolListChangedNotification);
     method!(proxy_not notify_prompt_list_changed PromptListChangedNotification);
 
-    fn get_peer_proxy(&self) -> Option<PeerProxy<RoleServer>> {
+    fn get_peer_sink(&self) -> Option<Peer<RoleServer>> {
         None
     }
 
-    fn set_peer_proxy(&mut self, peer: PeerProxy<RoleServer>) {
+    fn set_peer_sink(&mut self, peer: Peer<RoleServer>) {
         drop(peer);
+    }
+
+    fn set_peer_info(&mut self, peer: <RoleServer as ServiceRole>::PeerInfo) {
+        drop(peer);
+    }
+
+    fn get_peer_info(&self) -> Option<<RoleServer as ServiceRole>::PeerInfo> {
+        None
+    }
+
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::default()
     }
 }

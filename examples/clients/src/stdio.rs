@@ -1,61 +1,58 @@
-use std::collections::HashMap;
-
 use anyhow::Result;
-use mcp_client::{
-    ClientCapabilities, ClientInfo, Error as ClientError, McpClient, McpClientTrait, McpService,
-    StdioTransport, Transport,
-};
-use std::time::Duration;
-use tracing_subscriber::EnvFilter;
+use mcp_client::handler::ClientHandlerService;
+use mcp_client::serve_client;
+use mcp_client::transport::child_process::child_process;
+use mcp_core::schema::CallToolRequestParam;
+
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+mod common;
+use common::simple_client::SimpleClient;
 
 #[tokio::main]
-async fn main() -> Result<(), ClientError> {
+async fn main() -> Result<()> {
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("mcp_client=debug".parse().unwrap())
-                .add_directive("eventsource_client=debug".parse().unwrap()),
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("info,{}=debug", env!("CARGO_CRATE_NAME")).into()),
         )
+        .with(tracing_subscriber::fmt::layer())
         .init();
+    let (mut process, transport) = child_process(
+        tokio::process::Command::new("uvx")
+            .arg("mcp-server-git")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?,
+    )?;
+    let client = ClientHandlerService::new(SimpleClient::default());
 
-    // 1) Create the transport
-    let transport = StdioTransport::new("uvx", vec!["mcp-server-git".to_string()], HashMap::new());
-
-    // 2) Start the transport to get a handle
-    let transport_handle = transport.start().await?;
-
-    // 3) Create the service with timeout middleware
-    let service = McpService::with_timeout(transport_handle, Duration::from_secs(10));
-
-    // 4) Create the client with the middleware-wrapped service
-    let mut client = McpClient::new(service);
+    let running_service = serve_client(client, transport).await.inspect_err(|e| {
+        tracing::error!("client error: {:?}", e);
+    })?;
 
     // Initialize
-    let server_info = client
-        .initialize(
-            ClientInfo {
-                name: "test-client".into(),
-                version: "1.0.0".into(),
-            },
-            ClientCapabilities::default(),
-        )
-        .await?;
-    println!("Connected to server: {server_info:?}\n");
+    let server_info = running_service.peer().info();
+    tracing::info!("Connected to server: {server_info:#?}");
 
     // List tools
-    let tools = client.list_tools(None).await?;
-    println!("Available tools: {tools:?}\n");
+    let tools = running_service
+        .peer()
+        .list_tools(Default::default())
+        .await?;
+    tracing::info!("Available tools: {tools:#?}");
 
     // Call tool 'git_status' with arguments = {"repo_path": "."}
-    let tool_result = client
-        .call_tool("git_status", serde_json::json!({ "repo_path": "." }))
+    let tool_result = running_service
+        .peer()
+        .call_tool(CallToolRequestParam {
+            name: "git_status".into(),
+            arguments: serde_json::json!({ "repo_path": "." }).as_object().cloned(),
+        })
         .await?;
-    println!("Tool result: {tool_result:?}\n");
+    tracing::info!("Tool result: {tool_result:#?}");
 
-    // List resources
-    let resources = client.list_resources(None).await?;
-    println!("Available resources: {resources:?}\n");
-
+    process.kill().await?;
     Ok(())
 }

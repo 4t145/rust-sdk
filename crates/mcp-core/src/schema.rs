@@ -293,6 +293,13 @@ impl<Req, Resp, Noti> Message<Req, Resp, Noti> {
             _ => None,
         }
     }
+    pub fn into_result(self) -> Option<(Result<Resp, ErrorData>, RequestId)> {
+        match self {
+            Message::Response(result, id) => Some((Ok(result), id)),
+            Message::Error(error, id) => Some((Err(error), id)),
+            _ => None,
+        }
+    }
     pub fn into_json_rpc_message(self) -> JsonRpcMessage<Req, Resp, Noti> {
         match self {
             Message::Request(request, id) => JsonRpcMessage::Request(JsonRpcRequest {
@@ -365,7 +372,7 @@ pub type InitializedNotification = NotificationNoParam<InitializedNotificationMe
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeRequestParam {
-    pub protocol_version: String,
+    pub protocol_version: LatestProtocolVersion,
     pub capabilities: ClientCapabilities,
     pub client_info: Implementation,
 }
@@ -380,6 +387,30 @@ pub struct InitializeResult {
     pub instructions: Option<String>,
 }
 
+pub type ServerInfo = InitializeResult;
+pub type ClientInfo = InitializeRequestParam;
+
+impl Default for ServerInfo {
+    fn default() -> Self {
+        ServerInfo {
+            protocol_version: LatestProtocolVersion,
+            capabilities: ServerCapabilities::default(),
+            server_info: Implementation::from_build_env(),
+            instructions: None,
+        }
+    }
+}
+
+impl Default for ClientInfo {
+    fn default() -> Self {
+        ClientInfo {
+            protocol_version: LatestProtocolVersion,
+            capabilities: ClientCapabilities::default(),
+            client_info: Implementation::from_build_env(),
+        }
+    }
+}
+
 pub type ExperimentalCapabilities = BTreeMap<String, JsonObject>;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -387,7 +418,7 @@ pub type ExperimentalCapabilities = BTreeMap<String, JsonObject>;
 pub struct RootsCapabilities {
     list_changed: Option<bool>,
 }
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct ClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalCapabilities>,
@@ -456,7 +487,7 @@ pub struct ToolsCapability {
     pub list_changed: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PaginatedRequestParam {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -752,7 +783,7 @@ const_string!(CallToolRequestMethod = "tools/call");
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CallToolRequestParam {
-    pub name: String,
+    pub name: Cow<'static, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<JsonObject>,
 }
@@ -986,7 +1017,6 @@ mod tests {
                         client_info,
                     },
             }) => {
-                assert_eq!(protocol_version, "2024-11-05");
                 assert_eq!(capabilities.roots.unwrap().list_changed, Some(true));
                 assert_eq!(capabilities.sampling.unwrap().len(), 0);
                 assert_eq!(client_info.name, "ExampleClient");

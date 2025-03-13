@@ -5,9 +5,9 @@ use axum::{
     response::sse::{Event, Sse},
     routing::get,
 };
-use futures::{StreamExt, stream::Stream};
+use futures::{SinkExt, StreamExt, stream::Stream};
 use mcp_core::{schema::ClientJsonRpcMessage, transport::Transport};
-use mcp_server::{ServerHandlerService, serve};
+use mcp_server::{ServerHandlerService, serve_server};
 use std::collections::HashMap;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -57,6 +57,7 @@ async fn post_event_handler(
     Query(PostEventQuery { session_id }): Query<PostEventQuery>,
     Json(message): Json<ClientJsonRpcMessage>,
 ) -> Result<StatusCode, StatusCode> {
+    tracing::info!(session_id, ?message, "new client message");
     let tx = {
         let rg = app.txs.read().await;
         rg.get(session_id.as_str())
@@ -87,13 +88,23 @@ async fn sse_handler(State(app): State<App>) -> Sse<impl Stream<Item = Result<Ev
         tokio::spawn(async move {
             let service = ServerHandlerService::new(common::counter::Counter::new());
             let stream = ReceiverStream::new(from_client_rx);
-            let sink = PollSender::new(to_client_tx);
-            let _result = serve(service, Transport::new(sink, stream))
+            let sink = PollSender::new(to_client_tx).sink_map_err(std::io::Error::other);
+            let result = serve_server(service, Transport::new(sink, stream))
                 .await
                 .inspect_err(|e| {
                     tracing::error!("serving error: {:?}", e);
                 });
+            
+            if let Err(e) = result {
+                tracing::error!(error = ?e, "initialize error");
+                app.txs.write().await.remove(&session);
+                return
+            }
+            let _running_result = result.unwrap().waiting().await.inspect_err(|e|{
+                tracing::error!(error = ?e, "running error");
+            });
             app.txs.write().await.remove(&session);
+
         });
     }
 
