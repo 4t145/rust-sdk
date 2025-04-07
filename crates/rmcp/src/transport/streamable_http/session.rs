@@ -1,5 +1,9 @@
-use std::collections::HashMap;
+use std::{
+    borrow::Cow,
+    collections::{HashMap, VecDeque},
+};
 
+use serde::de;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::model::{
@@ -10,11 +14,47 @@ use crate::model::{
 
 pub const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EventId {
+    request_id: RequestId,
+    index: usize,
+}
+
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.index, self.request_id)
+    }
+}
+
+pub enum EventIdParseError {
+    MissingSessionId,
+    InvalidIndex(String),
+}
+
+impl std::str::FromStr for EventId {
+    type Err = EventIdParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (index, request_id) = s
+            .split_once("-")
+            .ok_or(|_|EventIdParseError::MissingSessionId)?;
+        let index = usize::from_str(index)
+            .map_err(|_| EventIdParseError::InvalidIndex("invalid index".into()))?;
+
+        Ok(EventId {
+            session_id: session_id.into(),
+            request_id: crate::model::NumberOrString::String(),
+            index,
+        })
+    }
+}
+
 type SessionId = String;
 
 struct RequestWise {
     progress_token: Option<ProgressToken>,
     tx: Sender<ServerJsonRpcMessage>,
+    cache: VecDeque<ServerJsonRpcMessage>,
+    cursor: usize,
 }
 
 pub struct Session {
@@ -29,6 +69,7 @@ pub struct Session {
 pub enum SessionError {
     DuplicatedRequestId(RequestId),
     RequestWiseChannelClosed(RequestId),
+    EventIdParseError(Cow<'static, str>),
     CommonChannelClosed,
     TransportClosed,
 }
