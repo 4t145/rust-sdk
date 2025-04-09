@@ -68,6 +68,12 @@ transport-sse-server = [
     "dep:rand",
     "dep:tokio-stream",
 ]
+transport-streamable-http-server = [
+    "transport-async-rw",
+    "dep:axum",
+    "dep:rand",
+    "dep:tokio-stream",
+]
 # transport-ws = ["transport-io", "dep:tokio-tungstenite"]
 tower = ["dep:tower-service"]
 [dev-dependencies]

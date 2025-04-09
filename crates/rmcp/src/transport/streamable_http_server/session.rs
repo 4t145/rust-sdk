@@ -1,21 +1,28 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     num::ParseIntError,
     sync::Arc,
 };
 
-use serde::de;
+use futures::{FutureExt, Sink, SinkExt, Stream};
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{Receiver, Sender},
     oneshot,
 };
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::PollSender;
 
-use crate::model::{
-    CancelledNotificationParam, ClientJsonRpcMessage, ClientRequest, GetMeta, InitializeRequest,
-    InitializedNotification, JsonRpcNotification, JsonRpcRequest, Notification,
-    ProgressNotificationParam, ProgressToken, RequestId, ServerJsonRpcMessage, ServerNotification,
+use crate::{
+    RoleServer,
+    model::{
+        CancelledNotificationParam, ClientJsonRpcMessage, ClientRequest, GetMeta,
+        InitializeRequest, InitializedNotification, JsonRpcNotification, JsonRpcRequest,
+        Notification, ProgressNotificationParam, ProgressToken, RequestId, ServerJsonRpcMessage,
+        ServerNotification,
+    },
+    transport::IntoTransport,
 };
 
 pub const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
@@ -25,20 +32,19 @@ pub struct ServerSessionMessage {
     pub message: Arc<ServerJsonRpcMessage>,
 }
 
-/// <index>-<[n|s]>-<request_id>
+/// <index>-<request_id>
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EventId {
-    request_id: Option<RequestId>,
+    http_request_id: Option<HttpRequestId>,
     index: usize,
 }
 
 impl std::fmt::Display for EventId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.index)?;
-        match &self.request_id {
-            Some(crate::model::NumberOrString::Number(number)) => write!(f, "-n-{}", number),
-            Some(crate::model::NumberOrString::String(string)) => write!(f, "-s-{}", string),
-            None => write!(f, "-c"),
+        match &self.http_request_id {
+            Some(http_request_id) => write!(f, "/{http_request_id}"),
+            None => write!(f, ""),
         }
     }
 }
@@ -58,43 +64,39 @@ pub enum EventIdParseError {
 impl std::str::FromStr for EventId {
     type Err = EventIdParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (index, maybe_request_id) = s
-            .split_once("-")
-            .ok_or(EventIdParseError::MissingRequestId)?;
-        let index = usize::from_str(index).map_err(EventIdParseError::InvalidIndex)?;
-        let request_id = if let Some(number) = maybe_request_id.strip_prefix("n-") {
-            let number = number
-                .parse::<u32>()
-                .map_err(EventIdParseError::InvalidNumericRequestId)?;
-            Some(crate::model::NumberOrString::Number(number))
-        } else if let Some(string) = maybe_request_id.strip_prefix("s-") {
-            let string = string.to_string();
-            Some(crate::model::NumberOrString::String(string.into()))
-        } else if "c" == maybe_request_id {
-            None
+        if let Some((index, request_id)) = s.split_once("/") {
+            let index = usize::from_str(index).map_err(EventIdParseError::InvalidIndex)?;
+            let request_id = u64::from_str(request_id).map_err(EventIdParseError::InvalidIndex)?;
+            Ok(EventId {
+                http_request_id: Some(request_id),
+                index,
+            })
         } else {
-            return Err(EventIdParseError::InvalidRequestIdType);
-        };
-        Ok(EventId { request_id, index })
+            let index = usize::from_str(s).map_err(EventIdParseError::InvalidIndex)?;
+            Ok(EventId {
+                http_request_id: None,
+                index,
+            })
+        }
     }
 }
 
-type SessionId = String;
+pub type SessionId = Arc<str>;
 
 struct CachedTx {
     tx: Sender<ServerSessionMessage>,
     cache: VecDeque<ServerSessionMessage>,
-    request_id: Option<RequestId>,
+    http_request_id: Option<HttpRequestId>,
     capacity: usize,
 }
 
 impl CachedTx {
-    fn new(tx: Sender<ServerSessionMessage>, request_id: Option<RequestId>) -> Self {
+    fn new(tx: Sender<ServerSessionMessage>, http_request_id: Option<HttpRequestId>) -> Self {
         Self {
             cache: VecDeque::with_capacity(tx.capacity()),
             capacity: tx.capacity(),
             tx,
-            request_id,
+            http_request_id,
         }
     }
     fn new_common(tx: Sender<ServerSessionMessage>) -> Self {
@@ -104,7 +106,7 @@ impl CachedTx {
     async fn send(&mut self, message: ServerJsonRpcMessage) {
         let index = self.cache.back().map_or(0, |m| m.event_id.index + 1);
         let event_id = EventId {
-            request_id: self.request_id.clone(),
+            http_request_id: self.http_request_id.clone(),
             index,
         };
         let message = ServerSessionMessage {
@@ -133,7 +135,7 @@ impl CachedTx {
             let send_result = self.tx.send(message.clone()).await;
             if send_result.is_err() {
                 return Err(SessionError::ChannelClosed(
-                    message.event_id.request_id.clone(),
+                    message.event_id.http_request_id.clone(),
                 ));
             }
         }
@@ -141,37 +143,61 @@ impl CachedTx {
     }
 }
 
-struct RequestWise {
-    progress_token: Option<ProgressToken>,
+struct HttpRequestWise {
+    resources: HashSet<ResourceKey>,
     tx: CachedTx,
 }
 
-pub struct SessionContext {
+type HttpRequestId = u64;
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum ResourceKey {
+    McpRequestId(RequestId),
+    ProgressToken(ProgressToken),
+}
+
+struct SessionContext {
     id: SessionId,
-    request_router: HashMap<RequestId, RequestWise>,
+    next_http_request_id: HttpRequestId,
+    tx_router: HashMap<HttpRequestId, HttpRequestWise>,
+    resource_router: HashMap<ResourceKey, HttpRequestId>,
     common: CachedTx,
-    // ProgressToken - RequestId map
-    // pt_rid_map: HashMap<ProgressToken, RequestId>,
     to_service_tx: Sender<ClientJsonRpcMessage>,
     event_rx: Receiver<SessionEvent>,
 }
 
+#[derive(Debug, Error, Clone)]
 pub enum SessionError {
-    DuplicatedRequestId(RequestId),
-    ChannelClosed(Option<RequestId>),
+    #[error("Invalid request id: {0}")]
+    DuplicatedRequestId(HttpRequestId),
+    #[error("Channel closed: {0:?}")]
+    ChannelClosed(Option<HttpRequestId>),
+    #[error("Cannot parse event id: {0}")]
     EventIdParseError(Cow<'static, str>),
+    #[error("Session service terminated")]
     SessionServiceTerminated,
+    #[error("Invalid event id")]
     InvalidEventId,
+    #[error("Transport closed")]
     TransportClosed,
 }
 
 enum OutboundChannel {
-    RequestWise { id: RequestId, close: bool },
+    RequestWise { id: HttpRequestId, close: bool },
     Common,
+}
+
+pub struct StreamableHttpMessageReceiver {
+    pub http_request_id: Option<HttpRequestId>,
+    pub inner: Receiver<ServerSessionMessage>,
 }
 
 impl SessionContext {
     const REQUEST_WISE_CHANNEL_SIZE: usize = 16;
+    pub fn next_http_request_id(&mut self) -> HttpRequestId {
+        let id = self.next_http_request_id;
+        self.next_http_request_id = self.next_http_request_id.saturating_add_signed(1);
+        id
+    }
     pub fn session_id(&self) -> &SessionId {
         &self.id
     }
@@ -183,28 +209,20 @@ impl SessionContext {
     }
     pub async fn establish_request_wise_channel(
         &mut self,
-        request: ClientRequest,
-        request_id: RequestId,
-    ) -> Result<Receiver<ServerSessionMessage>, SessionError> {
-        if self.request_router.contains_key(&request_id) {
-            return Err(SessionError::DuplicatedRequestId(request_id.clone()));
-        };
-        let progress_token = request.get_meta().get_progress_token();
+    ) -> Result<StreamableHttpMessageReceiver, SessionError> {
+        let http_request_id = self.next_http_request_id();
         let (tx, rx) = tokio::sync::mpsc::channel(Self::REQUEST_WISE_CHANNEL_SIZE);
-        self.send_to_service(ClientJsonRpcMessage::Request(JsonRpcRequest {
-            request,
-            id: request_id.clone(),
-            jsonrpc: crate::model::JsonRpcVersion2_0,
-        }))
-        .await?;
-        self.request_router.insert(
-            request_id.clone(),
-            RequestWise {
-                progress_token,
-                tx: CachedTx::new(tx, Some(request_id)),
+        self.tx_router.insert(
+            http_request_id,
+            HttpRequestWise {
+                resources: Default::default(),
+                tx: CachedTx::new(tx, Some(http_request_id)),
             },
         );
-        Ok(rx)
+        Ok(StreamableHttpMessageReceiver {
+            http_request_id: Some(http_request_id),
+            inner: rx,
+        })
     }
     fn resolve_outbound_channel(&self, message: &ServerJsonRpcMessage) -> OutboundChannel {
         match &message {
@@ -217,9 +235,10 @@ impl SessionContext {
                     }),
                 ..
             }) => {
-                let id = self.request_router.iter().find_map(|(id, r)| {
-                    (r.progress_token.as_ref() == Some(progress_token)).then_some(id)
-                });
+                let id = self
+                    .resource_router
+                    .get(&ResourceKey::ProgressToken(progress_token.clone()));
+
                 if let Some(id) = id {
                     OutboundChannel::RequestWise {
                         id: id.clone(),
@@ -236,19 +255,46 @@ impl SessionContext {
                         ..
                     }),
                 ..
-            }) => OutboundChannel::RequestWise {
-                id: request_id.clone(),
-                close: false,
-            },
+            }) => {
+                if let Some(id) = self
+                    .resource_router
+                    .get(&ResourceKey::McpRequestId(request_id.clone()))
+                {
+                    OutboundChannel::RequestWise {
+                        id: id.clone(),
+                        close: false,
+                    }
+                } else {
+                    OutboundChannel::Common
+                }
+            }
             ServerJsonRpcMessage::Notification(_) => OutboundChannel::Common,
-            ServerJsonRpcMessage::Response(json_rpc_response) => OutboundChannel::RequestWise {
-                id: json_rpc_response.id.clone(),
-                close: false,
-            },
-            ServerJsonRpcMessage::Error(json_rpc_error) => OutboundChannel::RequestWise {
-                id: json_rpc_error.id.clone(),
-                close: true,
-            },
+            ServerJsonRpcMessage::Response(json_rpc_response) => {
+                if let Some(id) = self
+                    .resource_router
+                    .get(&ResourceKey::McpRequestId(json_rpc_response.id.clone()))
+                {
+                    OutboundChannel::RequestWise {
+                        id: id.clone(),
+                        close: false,
+                    }
+                } else {
+                    OutboundChannel::Common
+                }
+            }
+            ServerJsonRpcMessage::Error(json_rpc_error) => {
+                if let Some(id) = self
+                    .resource_router
+                    .get(&ResourceKey::McpRequestId(json_rpc_error.id.clone()))
+                {
+                    OutboundChannel::RequestWise {
+                        id: id.clone(),
+                        close: false,
+                    }
+                } else {
+                    OutboundChannel::Common
+                }
+            }
             ServerJsonRpcMessage::BatchRequest(_) | ServerJsonRpcMessage::BatchResponse(_) => {
                 // the server side should never yield a batch request or response now
                 unreachable!("server side won't yield batch request or response")
@@ -263,10 +309,10 @@ impl SessionContext {
         match outbound_channel {
             OutboundChannel::RequestWise { id, close } => {
                 let id = id.clone();
-                if let Some(request_wise) = self.request_router.get_mut(&id) {
+                if let Some(request_wise) = self.tx_router.get_mut(&id) {
                     request_wise.tx.send(message).await;
                     if close {
-                        self.request_router.remove(&id);
+                        self.tx_router.remove(&id);
                     }
                 } else {
                     return Err(SessionError::ChannelClosed(Some(id)));
@@ -279,20 +325,23 @@ impl SessionContext {
     pub async fn resume(
         &mut self,
         last_event_id: EventId,
-    ) -> Result<Receiver<ServerSessionMessage>, SessionError> {
-        match last_event_id.request_id {
-            Some(request_id) => {
+    ) -> Result<StreamableHttpMessageReceiver, SessionError> {
+        match last_event_id.http_request_id {
+            Some(http_request_id) => {
                 let request_wise = self
-                    .request_router
-                    .get_mut(&request_id)
-                    .ok_or(SessionError::ChannelClosed(Some(request_id.clone())))?;
+                    .tx_router
+                    .get_mut(&http_request_id)
+                    .ok_or(SessionError::ChannelClosed(Some(http_request_id.clone())))?;
                 let channel = tokio::sync::mpsc::channel(Self::REQUEST_WISE_CHANNEL_SIZE);
                 let (tx, rx) = channel;
                 request_wise.tx.tx = tx;
                 let index = last_event_id.index;
                 // sync messages after index
                 request_wise.tx.sync(index).await?;
-                Ok(rx)
+                Ok(StreamableHttpMessageReceiver {
+                    http_request_id: Some(http_request_id),
+                    inner: rx,
+                })
             }
             None => {
                 let channel = tokio::sync::mpsc::channel(Self::REQUEST_WISE_CHANNEL_SIZE);
@@ -301,7 +350,10 @@ impl SessionContext {
                 let index = last_event_id.index;
                 // sync messages after index
                 self.common.sync(index).await?;
-                Ok(rx)
+                Ok(StreamableHttpMessageReceiver {
+                    http_request_id: None,
+                    inner: rx,
+                })
             }
         }
     }
@@ -311,17 +363,15 @@ enum SessionEvent {
     ServiceMessage(ServerJsonRpcMessage),
     ClientMessage(ClientJsonRpcMessage),
     EstablishRequestWiseChannel {
-        request: ClientRequest,
-        request_id: RequestId,
-        responder: oneshot::Sender<Result<Receiver<ServerSessionMessage>, SessionError>>,
+        responder: oneshot::Sender<Result<StreamableHttpMessageReceiver, SessionError>>,
     },
     CloseRequestWiseChannel {
-        id: RequestId,
+        id: HttpRequestId,
         responder: oneshot::Sender<Result<(), SessionError>>,
     },
     Resume {
         last_event_id: EventId,
-        responder: oneshot::Sender<Result<Receiver<ServerSessionMessage>, SessionError>>,
+        responder: oneshot::Sender<Result<StreamableHttpMessageReceiver, SessionError>>,
     },
 }
 
@@ -332,7 +382,7 @@ pub enum SessionQuitReason {
 }
 
 impl SessionContext {
-    pub async fn run_session(mut self: SessionContext) -> SessionQuitReason {
+    pub async fn run(mut self: SessionContext) -> SessionQuitReason {
         let quit_reason = loop {
             let event = tokio::select! {
                 event = self.event_rx.recv() => {
@@ -350,18 +400,12 @@ impl SessionContext {
                 SessionEvent::ClientMessage(json_rpc_message) => {
                     let handle_result = self.send_to_service(json_rpc_message).await;
                 }
-                SessionEvent::EstablishRequestWiseChannel {
-                    request,
-                    request_id,
-                    responder,
-                } => {
-                    let handle_result = self
-                        .establish_request_wise_channel(request, request_id)
-                        .await;
+                SessionEvent::EstablishRequestWiseChannel { responder } => {
+                    let handle_result = self.establish_request_wise_channel().await;
                     let _ = responder.send(handle_result);
                 }
                 SessionEvent::CloseRequestWiseChannel { id, responder } => {
-                    let handle_result = self.request_router.remove(&id);
+                    let handle_result = self.tx_router.remove(&id);
                     let _ = responder.send(Ok(()));
                 }
                 SessionEvent::Resume {
@@ -405,16 +449,10 @@ impl SessionHandle {
 
     pub async fn establish_request_wise_channel(
         &self,
-        request: ClientRequest,
-        request_id: RequestId,
-    ) -> Result<Receiver<ServerSessionMessage>, SessionError> {
+    ) -> Result<StreamableHttpMessageReceiver, SessionError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.event_tx
-            .send(SessionEvent::EstablishRequestWiseChannel {
-                request,
-                request_id,
-                responder: tx,
-            })
+            .send(SessionEvent::EstablishRequestWiseChannel { responder: tx })
             .await
             .map_err(|_| SessionError::SessionServiceTerminated)?;
         rx.await
@@ -422,7 +460,7 @@ impl SessionHandle {
     }
     pub async fn close_request_wise_channel(
         &self,
-        request_id: RequestId,
+        request_id: HttpRequestId,
     ) -> Result<(), SessionError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.event_tx
@@ -437,12 +475,12 @@ impl SessionHandle {
     }
     pub async fn establish_common_channel(
         &self,
-    ) -> Result<Receiver<ServerSessionMessage>, SessionError> {
+    ) -> Result<StreamableHttpMessageReceiver, SessionError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.event_tx
             .send(SessionEvent::Resume {
                 last_event_id: EventId {
-                    request_id: None,
+                    http_request_id: None,
                     index: 0,
                 },
                 responder: tx,
@@ -456,7 +494,7 @@ impl SessionHandle {
     pub async fn resume(
         &self,
         last_event_id: EventId,
-    ) -> Result<Receiver<ServerSessionMessage>, SessionError> {
+    ) -> Result<StreamableHttpMessageReceiver, SessionError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.event_tx
             .send(SessionEvent::Resume {
@@ -471,23 +509,48 @@ impl SessionHandle {
 }
 
 pub struct SessionTransport {
-    from_service_rx: Receiver<ServerJsonRpcMessage>,
+    session_handle: SessionHandle,
+    to_service_rx: Receiver<ClientJsonRpcMessage>,
 }
 
-pub fn session(id: SessionId) -> (SessionContext, SessionTransport) {
-    let (service_tx, service_rx) = tokio::sync::mpsc::channel(16);
+impl IntoTransport<RoleServer, SessionError, ()> for SessionTransport {
+    fn into_transport(
+        self,
+    ) -> (
+        impl Sink<ServerJsonRpcMessage, Error = SessionError> + Send + 'static,
+        impl Stream<Item = ClientJsonRpcMessage> + Send + 'static,
+    ) {
+        let stream = ReceiverStream::new(self.to_service_rx);
+        let sink = PollSender::new(self.session_handle.event_tx.clone())
+            .sink_map_err(|_| SessionError::SessionServiceTerminated)
+            .with(async |m| Ok(SessionEvent::ServiceMessage(m)));
+        (sink, stream)
+    }
+}
+
+pub fn session(id: SessionId) -> (Session, SessionTransport) {
+    let (to_service_tx, to_service_rx) = tokio::sync::mpsc::channel(16);
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
     let (common_tx, _) = tokio::sync::mpsc::channel(0);
     let common = CachedTx::new_common(common_tx);
     let session_context = SessionContext {
+        next_http_request_id: 0,
         id,
-        request_router: HashMap::new(),
+        tx_router: HashMap::new(),
+        resource_router: HashMap::new(),
         common,
-        to_service_tx: service_tx,
+        to_service_tx,
         event_rx,
     };
-    let session_transport = SessionTransport {
-        from_service_rx: service_rx,
+    let handle = SessionHandle { event_tx };
+    let task_handle = tokio::spawn(session_context.run());
+    let session = Session {
+        handle: handle.clone(),
+        task_handle,
     };
-    (session_context, session_transport)
+    let session_transport = SessionTransport {
+        to_service_rx,
+        session_handle: handle,
+    };
+    (session, session_transport)
 }
