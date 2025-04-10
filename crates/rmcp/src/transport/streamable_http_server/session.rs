@@ -165,7 +165,7 @@ struct SessionContext {
     event_rx: Receiver<SessionEvent>,
 }
 
-#[derive(Debug, Error, Clone)]
+#[derive(Debug, Error)]
 pub enum SessionError {
     #[error("Invalid request id: {0}")]
     DuplicatedRequestId(HttpRequestId),
@@ -179,6 +179,22 @@ pub enum SessionError {
     InvalidEventId,
     #[error("Transport closed")]
     TransportClosed,
+    #[error("IO error: {0}")]
+    Io(std::io::Error),
+}
+
+impl From<SessionError> for std::io::Error {
+    fn from(value: SessionError) -> Self {
+        match value {
+            SessionError::Io(io) => io,
+            _ => std::io::Error::new(std::io::ErrorKind::Other, format!("Session error: {value}")),
+        }
+    }
+}
+impl From<std::io::Error> for SessionError {
+    fn from(value: std::io::Error) -> Self {
+        SessionError::Io(value)
+    }
 }
 
 enum OutboundChannel {

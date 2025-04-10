@@ -22,7 +22,9 @@ use crate::{
     transport::streamable_http_server::session::HEADER_SESSION_ID,
 };
 
-use super::session::{Session, SessionId, SessionTransport};
+use super::session::{
+    self, EventId, Session, SessionId, SessionTransport, StreamableHttpMessageReceiver,
+};
 type SessionManager = Arc<tokio::sync::RwLock<HashMap<SessionId, Session>>>;
 pub type TransportReceiver = ReceiverStream<RxJsonRpcMessage<RoleServer>>;
 
@@ -38,10 +40,7 @@ struct App {
 impl App {
     pub fn new(
         sse_ping_interval: Duration,
-    ) -> (
-        Self,
-        tokio::sync::mpsc::UnboundedReceiver<SessionTransport>,
-    ) {
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<SessionTransport>) {
         let (transport_tx, transport_rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Self {
@@ -59,16 +58,25 @@ fn session_id() -> SessionId {
     Arc::from(id)
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PostEventQuery {
-    pub session_id: String,
+fn receiver_as_stream(
+    receiver: StreamableHttpMessageReceiver,
+) -> impl Stream<Item = Result<Event, io::Error>> {
+    use futures::StreamExt;
+    ReceiverStream::new(receiver.inner).map(|message| {
+        match serde_json::to_string(&message.message) {
+            Ok(bytes) => Ok(Event::default()
+                .event("message")
+                .data(&bytes)
+                .id(message.event_id.to_string())),
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+        }
+    })
 }
 
 async fn post_handler(
     State(app): State<App>,
-    Json(message): Json<ClientJsonRpcMessage>,
     header_map: HeaderMap,
+    Json(message): Json<ClientJsonRpcMessage>,
 ) -> Result<Response, StatusCode> {
     use futures::StreamExt;
     if let Some(session_id) = header_map.get(HEADER_SESSION_ID) {
@@ -96,16 +104,16 @@ async fn post_handler(
                             .id(message.event_id.to_string())),
                         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
                     });
-                return Ok(Sse::new(stream)
+                Ok(Sse::new(stream)
                     .keep_alive(KeepAlive::new().interval(app.sse_ping_interval))
-                    .into_response());
+                    .into_response())
             }
             _ => {
                 let result = handle.push_message(message).await;
                 if result.is_err() {
-                    return Err(StatusCode::GONE);
+                    Err(StatusCode::GONE)
                 } else {
-                    return Ok(StatusCode::ACCEPTED.into_response());
+                    Ok(StatusCode::ACCEPTED.into_response())
                 }
             }
         }
@@ -136,12 +144,66 @@ async fn post_handler(
 async fn get_handler(
     State(app): State<App>,
     header_map: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, io::Error>>>, Response<String>> {
-    let last_event_id = header_map
-        .get("Last-Event-Id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    
+) -> Result<Sse<impl Stream<Item = Result<Event, io::Error>>>, Response> {
+    let session_id = header_map
+        .get(HEADER_SESSION_ID)
+        .and_then(|v| v.to_str().ok());
+    if let Some(session_id) = session_id {
+        let last_event_id = header_map
+            .get("Last-Event-Id")
+            .and_then(|v| v.to_str().ok());
+        match last_event_id {
+            Some(last_event_id) => {
+                let last_event_id = last_event_id.parse::<EventId>().map_err(|e| {
+                    (StatusCode::BAD_REQUEST, format!("invalid event_id {e}")).into_response()
+                })?;
+                let sm = app.session_manager.read().await;
+                let session = sm.get(session_id).ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("session {session_id} not found"),
+                    )
+                        .into_response()
+                })?;
+                let handle = session.handle();
+                let receiver = handle.resume(last_event_id).await.map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("resume error {e}"),
+                    )
+                        .into_response()
+                })?;
+                let stream = receiver_as_stream(receiver);
+                return Ok(
+                    Sse::new(stream).keep_alive(KeepAlive::new().interval(app.sse_ping_interval))
+                );
+            }
+            None => {
+                let sm = app.session_manager.read().await;
+                let session = sm.get(session_id).ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("session {session_id} not found"),
+                    )
+                        .into_response()
+                })?;
+                let handle = session.handle();
+                let receiver = handle.establish_common_channel().await.map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("establish common channel error {e}"),
+                    )
+                        .into_response()
+                })?;
+                let stream = receiver_as_stream(receiver);
+                return Ok(
+                    Sse::new(stream).keep_alive(KeepAlive::new().interval(app.sse_ping_interval))
+                );
+            }
+        }
+    } else {
+        Err((StatusCode::BAD_REQUEST, "missing session id").into_response())
+    }
 }
 
 async fn delete_handler(
@@ -162,8 +224,92 @@ async fn delete_handler(
 #[derive(Debug, Clone)]
 pub struct SseServerConfig {
     pub bind: SocketAddr,
-    pub sse_path: String,
-    pub post_path: String,
+    pub path: String,
     pub ct: CancellationToken,
     pub sse_keep_alive: Option<Duration>,
+}
+
+#[derive(Debug)]
+pub struct StreamableHttpServer {
+    transport_rx: tokio::sync::mpsc::UnboundedReceiver<SessionTransport>,
+    pub config: SseServerConfig,
+}
+
+impl StreamableHttpServer {
+    pub async fn serve(bind: SocketAddr) -> io::Result<Self> {
+        Self::serve_with_config(SseServerConfig {
+            bind,
+            path: "/sse".to_string(),
+            ct: CancellationToken::new(),
+            sse_keep_alive: None,
+        })
+        .await
+    }
+    pub async fn serve_with_config(config: SseServerConfig) -> io::Result<Self> {
+        let (sse_server, service) = Self::new(config);
+        let listener = tokio::net::TcpListener::bind(sse_server.config.bind).await?;
+        let ct = sse_server.config.ct.child_token();
+        let server = axum::serve(listener, service).with_graceful_shutdown(async move {
+            ct.cancelled().await;
+            tracing::info!("sse server cancelled");
+        });
+        tokio::spawn(
+            async move {
+                if let Err(e) = server.await {
+                    tracing::error!(error = %e, "sse server shutdown with error");
+                }
+            }
+            .instrument(tracing::info_span!("sse-server", bind_address = %sse_server.config.bind)),
+        );
+        Ok(sse_server)
+    }
+
+    /// Warning: This function creates a new SseServer instance with the provided configuration.
+    /// `App.post_path` may be incorrect if using `Router` as an embedded router.
+    pub fn new(config: SseServerConfig) -> (StreamableHttpServer, Router) {
+        let (app, transport_rx) =
+            App::new(config.sse_keep_alive.unwrap_or(DEFAULT_AUTO_PING_INTERVAL));
+        let router = Router::new()
+            .route(
+                &config.path,
+                get(get_handler).post(post_handler).delete(delete_handler),
+            )
+            .with_state(app);
+
+        let server = StreamableHttpServer {
+            transport_rx,
+            config,
+        };
+
+        (server, router)
+    }
+
+    pub fn with_service<S, F>(mut self, service_provider: F) -> CancellationToken
+    where
+        S: Service<RoleServer>,
+        F: Fn() -> S + Send + 'static,
+    {
+        use crate::service::ServiceExt;
+        let ct = self.config.ct.clone();
+        tokio::spawn(async move {
+            while let Some(transport) = self.next_transport().await {
+                let service = service_provider();
+                let ct = self.config.ct.child_token();
+                tokio::spawn(async move {
+                    let server = service.serve_with_ct(transport, ct).await?;
+                    server.waiting().await?;
+                    tokio::io::Result::Ok(())
+                });
+            }
+        });
+        ct
+    }
+
+    pub fn cancel(&self) {
+        self.config.ct.cancel();
+    }
+
+    pub async fn next_transport(&mut self) -> Option<SessionTransport> {
+        self.transport_rx.recv().await
+    }
 }
