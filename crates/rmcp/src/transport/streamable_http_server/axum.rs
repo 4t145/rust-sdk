@@ -1,9 +1,14 @@
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Query, State}, http::{HeaderMap, StatusCode}, response::{
-        sse::{Event, KeepAlive, Sse}, IntoResponse, Response
-    }, routing::{get, post}, Json, Router
+    Json, Router,
+    extract::{Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{get, post},
 };
 use futures::{Sink, SinkExt, Stream};
 use tokio_stream::wrappers::ReceiverStream;
@@ -17,7 +22,7 @@ use crate::{
     transport::streamable_http_server::session::HEADER_SESSION_ID,
 };
 
-use super::session::{Session, SessionId};
+use super::session::{Session, SessionId, SessionTransport};
 type SessionManager = Arc<tokio::sync::RwLock<HashMap<SessionId, Session>>>;
 pub type TransportReceiver = ReceiverStream<RxJsonRpcMessage<RoleServer>>;
 
@@ -26,17 +31,16 @@ const DEFAULT_AUTO_PING_INTERVAL: Duration = Duration::from_secs(15);
 #[derive(Clone)]
 struct App {
     session_manager: SessionManager,
-    transport_tx: tokio::sync::mpsc::UnboundedSender<SseServerTransport>,
+    transport_tx: tokio::sync::mpsc::UnboundedSender<SessionTransport>,
     sse_ping_interval: Duration,
 }
 
 impl App {
     pub fn new(
-        post_path: String,
         sse_ping_interval: Duration,
     ) -> (
         Self,
-        tokio::sync::mpsc::UnboundedReceiver<SseServerTransport>,
+        tokio::sync::mpsc::UnboundedReceiver<SessionTransport>,
     ) {
         let (transport_tx, transport_rx) = tokio::sync::mpsc::unbounded_channel();
         (
@@ -65,17 +69,14 @@ async fn post_handler(
     State(app): State<App>,
     Json(message): Json<ClientJsonRpcMessage>,
     header_map: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<Response, StatusCode> {
+    use futures::StreamExt;
     if let Some(session_id) = header_map.get(HEADER_SESSION_ID) {
         let session_id = session_id.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
         tracing::debug!(session_id, ?message, "new client message");
         let handle = {
-            let session = app
-                .session_manager
-                .read()
-                .await
-                .get(session_id)
-                .ok_or(StatusCode::NOT_FOUND)?;
+            let sm = app.session_manager.read().await;
+            let session = sm.get(session_id).ok_or(StatusCode::NOT_FOUND)?;
             session.handle().clone()
         };
         match &message {
@@ -84,130 +85,78 @@ async fn post_handler(
                     .establish_request_wise_channel()
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                let stream = futures::stream::once(futures::future::ok(
-                    Event::default()
-                        .event("endpoint")
-                        .data(format!("?sessionId={session}")),
-                ))
-                .chain(ReceiverStream::new(to_client_rx).map(|message| {
-                    match serde_json::to_string(&message) {
-                        Ok(bytes) => Ok(Event::default().event("message").data(&bytes)),
+
+                let stream =
+                    ReceiverStream::new(receiver.inner).map(|message| match serde_json::to_string(
+                        &message.message,
+                    ) {
+                        Ok(bytes) => Ok(Event::default()
+                            .event("message")
+                            .data(&bytes)
+                            .id(message.event_id.to_string())),
                         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-                    }
-                }))
+                    });
+                return Ok(Sse::new(stream)
+                    .keep_alive(KeepAlive::new().interval(app.sse_ping_interval))
+                    .into_response());
             }
-            ClientJsonRpcMessage::Notification(json_rpc_notification) => todo!(),
-            ClientJsonRpcMessage::Response(json_rpc_response) => todo!(),
-            ClientJsonRpcMessage::BatchResponse(json_rpc_batch_response_items) => todo!(),
-            ClientJsonRpcMessage::Error(json_rpc_error) => todo!(),
+            _ => {
+                let result = handle.push_message(message).await;
+                if result.is_err() {
+                    return Err(StatusCode::GONE);
+                } else {
+                    return Ok(StatusCode::ACCEPTED.into_response());
+                }
+            }
         }
-        handle
-            .push_message(message)
-            .await
-            .map_err(|_| StatusCode::GONE)?;
     } else {
-    };
-    let tx = {
-        let rg = app.session_manager.read().await;
-        rg.get(session_id.as_str())
-            .ok_or(StatusCode::NOT_FOUND)?
-            .clone()
-    };
-    if tx.send(message).await.is_err() {
-        tracing::error!("send message error");
-        return Err(StatusCode::GONE);
+        // expect initialize message
+        let session_id = session_id();
+        let (session, transport) = super::session::session(session_id.clone());
+        let Ok(_) = app.transport_tx.send(transport) else {
+            return Err(StatusCode::GONE);
+        };
+
+        let Ok(response) = session.handle().initialize(message).await else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        let mut response = Json(response).into_response();
+        response.headers_mut().insert(
+            HEADER_SESSION_ID,
+            HeaderValue::from_bytes(session_id.as_bytes()).expect("should be valid header value"),
+        );
+        app.session_manager
+            .write()
+            .await
+            .insert(session_id, session);
+        return Ok(response);
     }
-    Ok(StatusCode::ACCEPTED)
 }
 
 async fn get_handler(
     State(app): State<App>,
+    header_map: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, io::Error>>>, Response<String>> {
-    let session = session_id();
-    tracing::info!(%session, "sse connection");
-    use tokio_stream::{StreamExt, wrappers::ReceiverStream};
-    use tokio_util::sync::PollSender;
-    let (from_client_tx, from_client_rx) = tokio::sync::mpsc::channel(64);
-    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel(64);
-    app.session_manager
-        .write()
-        .await
-        .insert(session.clone(), from_client_tx);
-    let session = session.clone();
-    let stream = ReceiverStream::new(from_client_rx);
-    let sink = PollSender::new(to_client_tx);
-    let transport = SseServerTransport {
-        stream,
-        sink,
-        session_id: session.clone(),
-        tx_store: app.session_manager.clone(),
-    };
-    let transport_send_result = app.transport_tx.send(transport);
-    if transport_send_result.is_err() {
-        tracing::warn!("send transport out error");
-        let mut response =
-            Response::new("fail to send out transport, it seems server is closed".to_string());
-        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        return Err(response);
-    }
-    let ping_interval = app.sse_ping_interval;
-    let stream = futures::stream::once(futures::future::ok(
-        Event::default()
-            .event("endpoint")
-            .data(format!("?sessionId={session}")),
-    ))
-    .chain(ReceiverStream::new(to_client_rx).map(|message| {
-        match serde_json::to_string(&message) {
-            Ok(bytes) => Ok(Event::default().event("message").data(&bytes)),
-            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-        }
-    }));
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(ping_interval)))
+    let last_event_id = header_map
+        .get("Last-Event-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    
 }
 
 async fn delete_handler(
     State(app): State<App>,
-) -> Result<Sse<impl Stream<Item = Result<Event, io::Error>>>, Response<String>> {
-    let session = session_id();
-    tracing::info!(%session, "sse connection");
-    use tokio_stream::{StreamExt, wrappers::ReceiverStream};
-    use tokio_util::sync::PollSender;
-    let (from_client_tx, from_client_rx) = tokio::sync::mpsc::channel(64);
-    let (to_client_tx, to_client_rx) = tokio::sync::mpsc::channel(64);
-    app.session_manager
-        .write()
-        .await
-        .insert(session.clone(), from_client_tx);
-    let session = session.clone();
-    let stream = ReceiverStream::new(from_client_rx);
-    let sink = PollSender::new(to_client_tx);
-    let transport = SseServerTransport {
-        stream,
-        sink,
-        session_id: session.clone(),
-        tx_store: app.session_manager.clone(),
-    };
-    let transport_send_result = app.transport_tx.send(transport);
-    if transport_send_result.is_err() {
-        tracing::warn!("send transport out error");
-        let mut response =
-            Response::new("fail to send out transport, it seems server is closed".to_string());
-        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        return Err(response);
+    header_map: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    if let Some(session_id) = header_map.get(HEADER_SESSION_ID) {
+        let session_id = session_id.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let mut sm = app.session_manager.write().await;
+        let session = sm.remove(session_id).ok_or(StatusCode::NOT_FOUND)?;
+        session.handle();
+        Ok(StatusCode::ACCEPTED)
+    } else {
+        Err(StatusCode::BAD_REQUEST)
     }
-    let ping_interval = app.sse_ping_interval;
-    let stream = futures::stream::once(futures::future::ok(
-        Event::default()
-            .event("endpoint")
-            .data(format!("?sessionId={session}")),
-    ))
-    .chain(ReceiverStream::new(to_client_rx).map(|message| {
-        match serde_json::to_string(&message) {
-            Ok(bytes) => Ok(Event::default().event("message").data(&bytes)),
-            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-        }
-    }));
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(ping_interval)))
 }
 
 #[derive(Debug, Clone)]

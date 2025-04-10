@@ -373,16 +373,41 @@ enum SessionEvent {
         last_event_id: EventId,
         responder: oneshot::Sender<Result<StreamableHttpMessageReceiver, SessionError>>,
     },
+    InitializeRequest {
+        request: ClientJsonRpcMessage,
+        responder: oneshot::Sender<Result<ServerJsonRpcMessage, SessionError>>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum SessionQuitReason {
     ServiceTerminated,
     ClientTerminated,
+    ExpectInitializeRequest,
+    ExpectInitializeResponse,
 }
 
 impl SessionContext {
     pub async fn run(mut self: SessionContext) -> SessionQuitReason {
+        // waiting for initialize request
+        let Some(evt) = self.event_rx.recv().await else {
+            return SessionQuitReason::ServiceTerminated;
+        };
+        let SessionEvent::InitializeRequest { request, responder } = evt else {
+            return SessionQuitReason::ExpectInitializeRequest;
+        };
+        let send_result = self.send_to_service(request).await;
+        if let Err(e) = send_result {
+            responder.send(Err(e));
+            return SessionQuitReason::ServiceTerminated;
+        }
+        let Some(evt) = self.event_rx.recv().await else {
+            return SessionQuitReason::ServiceTerminated;
+        };
+        let SessionEvent::ServiceMessage(response) = evt else {
+            return SessionQuitReason::ExpectInitializeResponse;
+        };
+        responder.send(Ok(response));
         let quit_reason = loop {
             let event = tokio::select! {
                 event = self.event_rx.recv() => {
@@ -414,6 +439,9 @@ impl SessionContext {
                 } => {
                     let handle_result = self.resume(last_event_id).await;
                     let _ = responder.send(handle_result);
+                }
+                _ => {
+                    // ignore
                 }
             }
         };
@@ -499,6 +527,22 @@ impl SessionHandle {
         self.event_tx
             .send(SessionEvent::Resume {
                 last_event_id,
+                responder: tx,
+            })
+            .await
+            .map_err(|_| SessionError::SessionServiceTerminated)?;
+        rx.await
+            .map_err(|_| SessionError::SessionServiceTerminated)?
+    }
+
+    pub async fn initialize(
+        &self,
+        request: ClientJsonRpcMessage,
+    ) -> Result<ServerJsonRpcMessage, SessionError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.event_tx
+            .send(SessionEvent::InitializeRequest {
+                request,
                 responder: tx,
             })
             .await
