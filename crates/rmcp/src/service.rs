@@ -4,10 +4,10 @@ use thiserror::Error;
 use crate::{
     error::Error as McpError,
     model::{
-        CancelledNotification, CancelledNotificationParam, GetMeta, JsonRpcBatchRequestItem,
-        JsonRpcBatchResponseItem, JsonRpcError, JsonRpcMessage, JsonRpcNotification,
-        JsonRpcRequest, JsonRpcResponse, Meta, NumberOrString, ProgressToken, RequestId,
-        ServerJsonRpcMessage,
+        CancelledNotification, CancelledNotificationParam, Extensions, GetExtensions, GetMeta,
+        JsonRpcBatchRequestItem, JsonRpcBatchResponseItem, JsonRpcError, JsonRpcMessage,
+        JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Meta, NumberOrString, ProgressToken,
+        RequestId, ServerJsonRpcMessage,
     },
     transport::IntoTransport,
 };
@@ -59,12 +59,12 @@ impl<T> TransferObject for T where
 
 #[allow(private_bounds, reason = "there's no the third implementation")]
 pub trait ServiceRole: std::fmt::Debug + Send + Sync + 'static + Copy + Clone {
-    type Req: TransferObject + GetMeta;
+    type Req: TransferObject + GetMeta + GetExtensions;
     type Resp: TransferObject;
     type Not: TryInto<CancelledNotification, Error = Self::Not>
         + From<CancelledNotification>
         + TransferObject;
-    type PeerReq: TransferObject + GetMeta;
+    type PeerReq: TransferObject + GetMeta + GetExtensions;
     type PeerResp: TransferObject;
     type PeerNot: TryInto<CancelledNotification, Error = Self::PeerNot>
         + From<CancelledNotification>
@@ -471,6 +471,7 @@ pub struct RequestContext<R: ServiceRole> {
     pub ct: CancellationToken,
     pub id: RequestId,
     pub meta: Meta,
+    pub extensions: Extensions,
     /// An interface to fetch the remote client or server
     pub peer: Peer<R>,
 }
@@ -503,15 +504,16 @@ where
     T: IntoTransport<R, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    serve_inner(service, transport, peer_info, Default::default(), ct).await
+    let (peer, peer_rx) = Peer::new(Arc::new(AtomicU32RequestIdProvider::default()), peer_info);
+    serve_inner(service, transport, peer, peer_rx, ct).await
 }
 
 #[instrument(skip_all)]
 async fn serve_inner<R, S, T, E, A>(
     mut service: S,
     transport: T,
-    peer_info: R::PeerInfo,
-    id_provider: Arc<AtomicU32Provider>,
+    peer: Peer<R>,
+    mut peer_rx: tokio::sync::mpsc::Receiver<PeerSinkMessage<R>>,
     ct: CancellationToken,
 ) -> Result<RunningService<R, S>, E>
 where
@@ -524,14 +526,13 @@ where
     const SINK_PROXY_BUFFER_SIZE: usize = 64;
     let (sink_proxy_tx, mut sink_proxy_rx) =
         tokio::sync::mpsc::channel::<TxJsonRpcMessage<R>>(SINK_PROXY_BUFFER_SIZE);
-
+    let peer_info = peer.peer_info();
     if R::IS_CLIENT {
         tracing::info!(?peer_info, "Service initialized as client");
     } else {
         tracing::info!(?peer_info, "Service initialized as server");
     }
 
-    let (peer, mut peer_proxy) = <Peer<R>>::new(id_provider, peer_info);
     service.set_peer(peer.clone());
     let mut local_responder_pool = HashMap::new();
     let mut local_ct_pool = HashMap::<RequestId, CancellationToken>::new();
@@ -575,7 +576,7 @@ where
                             break QuitReason::Closed
                         }
                     }
-                    m = peer_proxy.recv() => {
+                    m = peer_rx.recv() => {
                         if let Some(m) = m {
                             Event::ProxyMessage(m)
                         } else {
@@ -667,6 +668,7 @@ where
                             id: id.clone(),
                             peer: peer.clone(),
                             meta: request.get_meta().clone(),
+                            extensions: request.extensions().clone(),
                         };
                         tokio::spawn(async move {
                             let result = service.handle_request(request, context).await;
