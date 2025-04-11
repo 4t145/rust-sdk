@@ -17,8 +17,8 @@ use tokio_util::sync::PollSender;
 use crate::{
     RoleServer,
     model::{
-        CancelledNotificationParam, ClientJsonRpcMessage, ClientRequest, GetMeta,
-        InitializeRequest, InitializedNotification, JsonRpcNotification, JsonRpcRequest,
+        CancelledNotificationParam, ClientJsonRpcMessage, ClientNotification, ClientRequest,
+        GetMeta, InitializeRequest, InitializedNotification, JsonRpcNotification, JsonRpcRequest,
         Notification, ProgressNotificationParam, ProgressToken, RequestId, ServerJsonRpcMessage,
         ServerNotification,
     },
@@ -209,13 +209,20 @@ pub struct StreamableHttpMessageReceiver {
 
 impl SessionContext {
     const REQUEST_WISE_CHANNEL_SIZE: usize = 16;
+    pub fn unregister_resource(&mut self, resource: &ResourceKey) {
+        if let Some(http_key) = self.resource_router.remove(&resource) {
+            if let Some(channel) = self.tx_router.get_mut(&http_key) {
+                channel.resources.remove(&resource);
+                if channel.resources.is_empty() {
+                    self.tx_router.remove(&http_key);
+                }
+            }
+        }
+    }
     pub fn next_http_request_id(&mut self) -> HttpRequestId {
         let id = self.next_http_request_id;
         self.next_http_request_id = self.next_http_request_id.saturating_add_signed(1);
         id
-    }
-    pub fn session_id(&self) -> &SessionId {
-        &self.id
     }
     pub async fn send_to_service(&self, message: ClientJsonRpcMessage) -> Result<(), SessionError> {
         if self.to_service_tx.send(message).await.is_err() {
@@ -324,7 +331,6 @@ impl SessionContext {
         let outbound_channel = self.resolve_outbound_channel(&message);
         match outbound_channel {
             OutboundChannel::RequestWise { id, close } => {
-                let id = id.clone();
                 if let Some(request_wise) = self.tx_router.get_mut(&id) {
                     request_wise.tx.send(message).await;
                     if close {
@@ -414,7 +420,7 @@ impl SessionContext {
         };
         let send_result = self.send_to_service(request).await;
         if let Err(e) = send_result {
-            responder.send(Err(e));
+            let _ = responder.send(Err(e));
             return SessionQuitReason::ServiceTerminated;
         }
         let Some(evt) = self.event_rx.recv().await else {
@@ -423,7 +429,10 @@ impl SessionContext {
         let SessionEvent::ServiceMessage(response) = evt else {
             return SessionQuitReason::ExpectInitializeResponse;
         };
-        responder.send(Ok(response));
+        let response_result = responder.send(Ok(response));
+        if response_result.is_err() {
+            return SessionQuitReason::ClientTerminated;
+        }
         let quit_reason = loop {
             let event = tokio::select! {
                 event = self.event_rx.recv() => {
@@ -436,9 +445,36 @@ impl SessionContext {
             };
             match event {
                 SessionEvent::ServiceMessage(json_rpc_message) => {
+                    // catch response
+                    match &json_rpc_message {
+                        crate::model::JsonRpcMessage::Response(json_rpc_response) => {
+                            
+                        },
+                        crate::model::JsonRpcMessage::Error(json_rpc_error) => {
+
+                        },
+                        crate::model::JsonRpcMessage::BatchResponse(
+                            json_rpc_batch_response_items,
+                        ) => {
+
+                        },
+                        _ => {
+
+                        }
+                    }
                     let handle_result = self.handle_server_message(json_rpc_message).await;
                 }
                 SessionEvent::ClientMessage(json_rpc_message) => {
+                    // catch cancellation notification
+                    if let ClientJsonRpcMessage::Notification(notification) = &json_rpc_message {
+                        if let ClientNotification::CancelledNotification(n) =
+                            &notification.notification
+                        {
+                            let request_id = n.params.request_id.clone();
+                            let resource = ResourceKey::McpRequestId(request_id);
+                            self.unregister_resource(&resource);
+                        }
+                    }
                     let handle_result = self.send_to_service(json_rpc_message).await;
                 }
                 SessionEvent::EstablishRequestWiseChannel { responder } => {

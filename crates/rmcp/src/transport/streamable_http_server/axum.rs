@@ -12,18 +12,16 @@ use axum::{
 };
 use futures::{Sink, SinkExt, Stream};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::{CancellationToken, PollSender};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::{
-    RoleServer, Service,
-    model::ClientJsonRpcMessage,
-    service::{RxJsonRpcMessage, TxJsonRpcMessage},
+    RoleServer, Service, model::ClientJsonRpcMessage, service::RxJsonRpcMessage,
     transport::streamable_http_server::session::HEADER_SESSION_ID,
 };
 
 use super::session::{
-    self, EventId, Session, SessionId, SessionTransport, StreamableHttpMessageReceiver,
+    EventId, Session, SessionId, SessionTransport, StreamableHttpMessageReceiver,
 };
 type SessionManager = Arc<tokio::sync::RwLock<HashMap<SessionId, Session>>>;
 pub type TransportReceiver = ReceiverStream<RxJsonRpcMessage<RoleServer>>;
@@ -137,7 +135,7 @@ async fn post_handler(
             .write()
             .await
             .insert(session_id, session);
-        return Ok(response);
+        Ok(response)
     }
 }
 
@@ -174,9 +172,7 @@ async fn get_handler(
                         .into_response()
                 })?;
                 let stream = receiver_as_stream(receiver);
-                return Ok(
-                    Sse::new(stream).keep_alive(KeepAlive::new().interval(app.sse_ping_interval))
-                );
+                Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(app.sse_ping_interval)))
             }
             None => {
                 let sm = app.session_manager.read().await;
@@ -196,9 +192,7 @@ async fn get_handler(
                         .into_response()
                 })?;
                 let stream = receiver_as_stream(receiver);
-                return Ok(
-                    Sse::new(stream).keep_alive(KeepAlive::new().interval(app.sse_ping_interval))
-                );
+                Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(app.sse_ping_interval)))
             }
         }
     } else {
