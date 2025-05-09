@@ -1,46 +1,31 @@
-//！ reference: https://html.spec.whatwg.org/multipage/server-sent-events.html
-use std::{
-    borrow::Cow,
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-    time::Duration,
-};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
-use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, future::BoxFuture, stream::BoxStream};
-use reqwest::{
-    Client as HttpClient, IntoUrl, Url,
-    header::{ACCEPT, HeaderValue},
-};
-use sse_stream::{Error as SseError, Sse, SseStream};
+use futures::{Sink, SinkExt, Stream, StreamExt, stream::BoxStream};
+pub use sse_stream::Error as SseError;
+use sse_stream::Sse;
 use thiserror::Error;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::{CancellationToken, PollSender};
 use tracing::Instrument;
 
-use crate::model::{ClientJsonRpcMessage, ClientRequest, JsonRpcRequest, ServerJsonRpcMessage};
+use crate::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 
-use super::common::http_header::{
-    EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
-};
 type BoxedSseStream = BoxStream<'static, Result<Sse, SseError>>;
+
 #[derive(Error, Debug)]
 pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
     #[error("SSE error: {0}")]
     Sse(#[from] SseError),
-    #[error("IO error: {0}")]
+    #[error("Io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Client error: {0}")]
     Client(E),
     #[error("unexpected end of stream")]
     UnexpectedEndOfStream,
-    #[error("unexpected client message: {0:?}")]
-    UnexpectedClientMessage(ClientJsonRpcMessage),
     #[error("unexpected server response: {0}")]
     UnexpectedServerResponse(Cow<'static, str>),
-    #[error("Url error: {0}")]
-    Url(#[from] url::ParseError),
     #[error("Unexpected content type: {0:?}")]
-    UnexpectedContentType(Option<HeaderValue>),
+    UnexpectedContentType(Option<String>),
     #[error("Server does not support SSE")]
     SeverDoesNotSupportSse,
     #[error("Server does not support delete session")]
@@ -53,29 +38,17 @@ pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
     TransportChannelClosed,
 }
 
-type SseStreamFuture<E> =
-    BoxFuture<'static, Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<E>>>;
-
-enum SseTransportState<E: std::error::Error + Send + Sync + 'static> {
-    Connected(BoxStream<'static, Result<Sse, SseError>>),
-    Retrying {
-        times: usize,
-        fut: SseStreamFuture<E>,
-    },
-    Fatal {
-        reason: String,
-    },
-}
-
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct SseTransportRetryConfig {
+pub struct SseRetryConfig {
     pub max_times: Option<usize>,
     pub min_duration: Duration,
 }
-impl SseTransportRetryConfig {
+
+impl SseRetryConfig {
     pub const DEFAULT_MIN_DURATION: Duration = Duration::from_millis(1000);
 }
-impl Default for SseTransportRetryConfig {
+
+impl Default for SseRetryConfig {
     fn default() -> Self {
         Self {
             max_times: None,
@@ -131,6 +104,7 @@ pub trait StreamableHttpClient: Clone + Send + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     fn post_message(
         &self,
+        uri: Arc<str>,
         message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
     ) -> impl Future<Output = Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>>>
@@ -138,10 +112,13 @@ pub trait StreamableHttpClient: Clone + Send + 'static {
     + '_;
     fn delete_session(
         &self,
-        session: Arc<str>,
+        uri: Arc<str>,
+        session_id: Arc<str>,
     ) -> impl Future<Output = Result<(), StreamableHttpError<Self::Error>>> + Send + '_;
     fn get_stream(
         &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
         last_event_id: Option<String>,
     ) -> impl Future<
         Output = Result<
@@ -157,160 +134,12 @@ pub struct RetryConfig {
     pub min_duration: Duration,
 }
 
-#[derive(Clone)]
-pub struct ReqwestSseClient {
-    http_client: HttpClient,
-    url: Url,
-}
-
-impl ReqwestSseClient {
-    pub fn new<U>(url: U) -> Result<Self, StreamableHttpError<reqwest::Error>>
-    where
-        U: IntoUrl,
-    {
-        let url = url.into_url()?;
-        Ok(Self {
-            http_client: HttpClient::default(),
-            url,
-        })
-    }
-
-    pub async fn new_with_timeout<U>(
-        url: U,
-        timeout: Duration,
-    ) -> Result<Self, StreamableHttpError<reqwest::Error>>
-    where
-        U: IntoUrl,
-    {
-        let mut client = HttpClient::builder();
-        client = client.timeout(timeout);
-        let client = client.build()?;
-        let url = url.into_url()?;
-        Ok(Self {
-            http_client: client,
-            url,
-        })
-    }
-
-    pub async fn new_with_client<U>(
-        url: U,
-        client: HttpClient,
-    ) -> Result<Self, StreamableHttpError<reqwest::Error>>
-    where
-        U: IntoUrl,
-    {
-        let url = url.into_url()?;
-        Ok(Self {
-            http_client: client,
-            url,
-        })
-    }
-}
-
-impl StreamableHttpClient for ReqwestSseClient {
-    type Error = reqwest::Error;
-    async fn get_stream(
-        &self,
-        last_event_id: Option<String>,
-    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
-        let mut request_builder = self
-            .http_client
-            .get(self.url.clone())
-            .header(ACCEPT, EVENT_STREAM_MIME_TYPE);
-        if let Some(last_event_id) = last_event_id {
-            request_builder = request_builder.header(HEADER_LAST_EVENT_ID, last_event_id);
-        }
-        let response = request_builder.send().await?;
-        let response = response.error_for_status()?;
-        if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-            return Err(StreamableHttpError::SeverDoesNotSupportSse);
-        }
-        match response.headers().get(reqwest::header::CONTENT_TYPE) {
-            Some(ct) => {
-                if !ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) {
-                    return Err(StreamableHttpError::UnexpectedContentType(Some(ct.clone())));
-                }
-            }
-            None => {
-                return Err(StreamableHttpError::UnexpectedContentType(None));
-            }
-        }
-        let event_stream = SseStream::from_byte_stream(response.bytes_stream()).boxed();
-        Ok(event_stream)
-    }
-
-    async fn delete_session(
-        &self,
-        session: Arc<str>,
-    ) -> Result<(), StreamableHttpError<Self::Error>> {
-        let response = self
-            .http_client
-            .delete(self.url.join(&session)?)
-            .send()
-            .await?;
-        // if method no allowed
-        if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-            tracing::debug!("this server doesn't support deleting session");
-            return Ok(());
-        }
-        let _response = response.error_for_status()?;
-        Ok(())
-    }
-
-    async fn post_message(
-        &self,
-        message: ClientJsonRpcMessage,
-        session_id: Option<Arc<str>>,
-    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let mut request = self
-            .http_client
-            .post(self.url.clone())
-            .header(ACCEPT, EVENT_STREAM_MIME_TYPE)
-            .header(ACCEPT, JSON_MIME_TYPE);
-        if let Some(session_id) = session_id {
-            request = request.header(HEADER_SESSION_ID, session_id.as_ref());
-        }
-        let response = request.json(&message).send().await?;
-        if response.status() == reqwest::StatusCode::ACCEPTED {
-            return Ok(StreamableHttpPostResponse::Accepted);
-        }
-        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE);
-        match content_type {
-            Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
-                let event_stream = SseStream::from_byte_stream(response.bytes_stream()).boxed();
-                Ok(StreamableHttpPostResponse::Sse(event_stream))
-            }
-            Some(ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
-                let session_id = response.headers().get(HEADER_SESSION_ID);
-                let session_id = session_id
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
-
-                let message: ServerJsonRpcMessage = response.json().await?;
-                Ok(StreamableHttpPostResponse::Json(
-                    StreamableHttpPostJsonResponse {
-                        message,
-                        session_id,
-                    },
-                ))
-            }
-            _ => {
-                // unexpected content type
-                tracing::error!("unexpected content type: {:?}", content_type);
-                Err(StreamableHttpError::UnexpectedContentType(
-                    content_type.cloned(),
-                ))
-            }
-        }
-    }
-}
-
 /// # Transport for client sse
 ///
 /// Call [`SseTransport::start`] to create a  new transport from url.
 ///
 /// Call [`SseTransport::start_with_client`] to create a new transport with a customized reqwest client.
-pub struct StreamableHttpTransport<C: StreamableHttpClient> {
+pub struct StreamableHttpClientTransport<C: StreamableHttpClient> {
     rx: ReceiverStream<ServerJsonRpcMessage>,
     tx: PollSender<ClientJsonRpcMessage>,
     result: Arc<std::sync::OnceLock<Result<(), StreamableHttpError<C::Error>>>>,
@@ -319,13 +148,23 @@ pub struct StreamableHttpTransport<C: StreamableHttpClient> {
 }
 
 #[derive(Debug, Clone)]
-pub struct SseTransportConfig {
-    pub url: Url,
-    pub retry_config: SseTransportRetryConfig,
+pub struct StreamableHttpClientTransportConfig {
+    pub uri: Arc<str>,
+    pub retry_config: SseRetryConfig,
     pub channel_buffer_capacity: usize,
 }
 
-impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
+impl Default for StreamableHttpClientTransportConfig {
+    fn default() -> Self {
+        Self {
+            uri: "localhost".into(),
+            retry_config: SseRetryConfig::default(),
+            channel_buffer_capacity: 16,
+        }
+    }
+}
+
+impl<C: StreamableHttpClient> StreamableHttpClientTransport<C> {
     fn try_get_result(&mut self) -> Result<(), StreamableHttpError<C::Error>> {
         if let Some(x) = Arc::get_mut(&mut self.result) {
             if let Some(result) = x.take() {
@@ -338,7 +177,8 @@ impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
         client: C,
         sse_stream: BoxedSseStream,
         sse_worker_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
-        config: SseTransportConfig,
+        session_id: Arc<str>,
+        config: StreamableHttpClientTransportConfig,
         ct: CancellationToken,
     ) -> Result<(), StreamableHttpError<C::Error>> {
         let mut sse_stream = sse_stream;
@@ -362,7 +202,9 @@ impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
                     'retry_loop: loop {
                         tracing::debug!("sse stream error: {e}, retrying in {:?}", retry_interval);
                         tokio::time::sleep(retry_interval).await;
-                        let retry_result = client.get_stream(last_event_id.clone()).await;
+                        let retry_result = client
+                            .get_stream(config.uri.clone(), session_id.clone(), last_event_id.clone())
+                            .await;
                         retry_times += 1;
                         match retry_result {
                             Ok(new_stream) => {
@@ -414,7 +256,7 @@ impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
         }
         Ok(())
     }
-    pub fn start_with_client(client: C, config: SseTransportConfig) -> Self {
+    pub fn start_with_client(client: C, config: StreamableHttpClientTransportConfig) -> Self {
         let transport_task_ct = CancellationToken::new();
         let (to_transport_tx, mut from_handler_rx) =
             tokio::sync::mpsc::channel::<ClientJsonRpcMessage>(config.channel_buffer_capacity);
@@ -436,7 +278,7 @@ impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
                     session_id,
                     message,
                 } = client
-                    .post_message(initialize_request, None)
+                    .post_message(config.uri.clone(), initialize_request, None)
                     .await?
                     .expect_json()?;
                 let Some(session_id) = session_id else {
@@ -455,7 +297,7 @@ impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
                     .ok_or(StreamableHttpError::UnexpectedEndOfStream)?;
                 // expect a initialized response
                 client
-                    .post_message(initialized_notification, Some(session_id.clone()))
+                    .post_message(config.uri.clone(), initialized_notification, Some(session_id.clone()))
                     .await?
                     .expect_accepted()?;
 
@@ -465,12 +307,13 @@ impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
                     StreamResult(Result<(), StreamableHttpError<E>>),
                 }
                 let mut streams = tokio::task::JoinSet::new();
-                match client.get_stream(None).await {
+                match client.get_stream(config.uri.clone(), session_id.clone(), None).await {
                     Ok(stream) => {
                         streams.spawn(Self::execute_sse_stream(
                             client.clone(),
                             stream,
                             sse_worker_tx.clone(),
+                            session_id.clone(),
                             config.clone(),
                             transport_task_ct.child_token(),
                         ));
@@ -514,7 +357,7 @@ impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
                     match event {
                         Event::ClientMessage(json_rpc_message) => {
                             let response = client
-                                .post_message(json_rpc_message, Some(session_id.clone()))
+                                .post_message(config.uri.clone(), json_rpc_message, Some(session_id.clone()))
                                 .await?;
                             match response {
                                 StreamableHttpPostResponse::Accepted => {
@@ -531,6 +374,7 @@ impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
                                         client.clone(),
                                         stream,
                                         sse_worker_tx.clone(),
+                                        session_id.clone(),
                                         config.clone(),
                                         transport_task_ct.child_token(),
                                     ));
@@ -558,7 +402,7 @@ impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
                 }
                 transport_task_ct.cancel();
                 streams.join_all().await;
-                let delete_session_result = client.delete_session(session_id.clone()).await;
+                let delete_session_result = client.delete_session(config.uri.clone(), session_id.clone()).await;
                 match delete_session_result {
                     Ok(_) => {
                         tracing::info!(session_id = session_id.as_ref(), "delete session success")
@@ -598,7 +442,7 @@ impl<C: StreamableHttpClient> StreamableHttpTransport<C> {
     }
 }
 
-impl<C> Stream for StreamableHttpTransport<C>
+impl<C> Stream for StreamableHttpClientTransport<C>
 where
     C: StreamableHttpClient,
 {
@@ -612,7 +456,7 @@ where
     }
 }
 
-impl<C> Sink<ClientJsonRpcMessage> for StreamableHttpTransport<C>
+impl<C> Sink<ClientJsonRpcMessage> for StreamableHttpClientTransport<C>
 where
     C: StreamableHttpClient,
 {

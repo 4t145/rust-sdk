@@ -15,15 +15,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use super::session::{
-    EventId, HEADER_LAST_EVENT_ID, Session, SessionTransport, StreamableHttpMessageReceiver,
-};
+use super::session::{EventId, Session, SessionTransport, StreamableHttpMessageReceiver};
 use crate::{
     RoleServer, Service,
     model::ClientJsonRpcMessage,
-    transport::{
-        common::axum::{DEFAULT_AUTO_PING_INTERVAL, SessionId, session_id},
-        streamable_http_server::session::HEADER_SESSION_ID,
+    transport::common::{
+        axum::{DEFAULT_AUTO_PING_INTERVAL, SessionId, session_id},
+        http_header::{HEADER_LAST_EVENT_ID, HEADER_SESSION_ID},
     },
 };
 type SessionManager = Arc<tokio::sync::RwLock<HashMap<SessionId, Session>>>;

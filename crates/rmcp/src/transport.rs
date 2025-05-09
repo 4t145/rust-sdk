@@ -81,7 +81,10 @@ pub mod streamable_http_server;
 #[cfg(feature = "transport-streamable-http-server")]
 pub use streamable_http_server::axum::StreamableHttpServer;
 
-pub mod streamable_http;
+#[cfg(feature = "__transport-streamable-http-client")]
+pub mod streamable_http_client;
+#[cfg(feature = "__transport-streamable-http-client")]
+pub use streamable_http_client::StreamableHttpClientTransport;
 
 /// Common use codes
 pub mod common;

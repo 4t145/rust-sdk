@@ -25,8 +25,7 @@ use crate::{
     transport::IntoTransport,
 };
 
-pub const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
-pub const HEADER_LAST_EVENT_ID: &str = "Last-Event-Id";
+
 #[derive(Debug, Clone)]
 pub struct ServerSessionMessage {
     pub event_id: EventId,
