@@ -25,7 +25,6 @@ use crate::{
     transport::IntoTransport,
 };
 
-
 #[derive(Debug, Clone)]
 pub struct ServerSessionMessage {
     pub event_id: EventId,

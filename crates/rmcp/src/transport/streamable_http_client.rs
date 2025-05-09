@@ -203,7 +203,11 @@ impl<C: StreamableHttpClient> StreamableHttpClientTransport<C> {
                         tracing::debug!("sse stream error: {e}, retrying in {:?}", retry_interval);
                         tokio::time::sleep(retry_interval).await;
                         let retry_result = client
-                            .get_stream(config.uri.clone(), session_id.clone(), last_event_id.clone())
+                            .get_stream(
+                                config.uri.clone(),
+                                session_id.clone(),
+                                last_event_id.clone(),
+                            )
                             .await;
                         retry_times += 1;
                         match retry_result {
