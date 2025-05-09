@@ -245,8 +245,8 @@ impl<C: StreamableHttpClient> StreamableHttpClientTransport<C> {
                 match serde_json::from_slice::<ServerJsonRpcMessage>(data.as_bytes()) {
                     Err(e) => tracing::warn!("failed to deserialize server message: {e}"),
                     Ok(message) => {
-                        let yeild_result = sse_worker_tx.send(message).await;
-                        if yeild_result.is_err() {
+                        let yield_result = sse_worker_tx.send(message).await;
+                        if yield_result.is_err() {
                             tracing::trace!("streamable http transport worker dropped, exiting");
                             break;
                         }
