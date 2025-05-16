@@ -57,6 +57,9 @@ uuid = { version = "1", features = ["v4"], optional = true }
 # macro
 rmcp-macros = { version = "0.1", workspace = true, optional = true }
 
+# debug
+git-version = { version = "0.3", optional = true }
+
 [features]
 default = ["base64", "macros", "server"]
 client = []
@@ -64,7 +67,10 @@ server = ["transport-async-rw", "dep:schemars"]
 macros = ["dep:rmcp-macros", "dep:paste"]
 __transport-sse = ["dep:reqwest", "dep:sse-stream", "dep:url"]
 transport-sse = ["__transport-sse", "reqwest?/rustls-tls"]
-transport-sse-tls-no-provider = ["__transport-sse", "reqwest?/rustls-tls-no-provider"]
+transport-sse-tls-no-provider = [
+    "__transport-sse",
+    "reqwest?/rustls-tls-no-provider",
+]
 transport-async-rw = ["tokio/io-util", "tokio-util/codec"]
 transport-io = ["transport-async-rw", "tokio/io-std"]
 transport-child-process = ["transport-async-rw", "tokio/process"]
@@ -91,6 +97,8 @@ auth = ["__auth", "reqwest?/rustls-tls"]
 auth-tls-no-provider = ["auth", "reqwest?/rustls-tls-no-provider"]
 schemars = ["dep:schemars"]
 
+debug = ["dep:git-version"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 schemars = { version = "0.8" }
@@ -109,12 +117,24 @@ path = "tests/test_tool_macros.rs"
 
 [[test]]
 name = "test_with_python"
-required-features = ["server", "client", "transport-sse-server", "transport-sse", "transport-child-process"]
+required-features = [
+    "server",
+    "client",
+    "transport-sse-server",
+    "transport-sse",
+    "transport-child-process",
+]
 path = "tests/test_with_python.rs"
 
 [[test]]
 name = "test_with_js"
-required-features = ["server", "client", "transport-sse-server", "transport-child-process", "transport-streamable-http-server"]
+required-features = [
+    "server",
+    "client",
+    "transport-sse-server",
+    "transport-child-process",
+    "transport-streamable-http-server",
+]
 path = "tests/test_with_js.rs"
 
 [[test]]
@@ -136,4 +156,3 @@ path = "tests/test_message_protocol.rs"
 name = "test_message_schema"
 required-features = ["server", "client", "schemars"]
 path = "tests/test_message_schema.rs"
-

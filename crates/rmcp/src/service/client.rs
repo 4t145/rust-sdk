@@ -123,6 +123,8 @@ where
     T: IntoTransport<RoleClient, E, A>,
     E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
 {
+    #[cfg(feature = "debug")]
+    let _rmcp_debug_info = crate::debug_info();
     let (sink, stream) = transport.into_transport();
     let mut sink = Box::pin(sink);
     let mut stream = Box::pin(stream);

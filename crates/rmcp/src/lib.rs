@@ -119,3 +119,46 @@ pub use schemars;
 pub use serde;
 #[cfg(feature = "macros")]
 pub use serde_json;
+
+#[cfg(feature = "debug")]
+/// Debugging information for the library. 
+/// 
+/// Please enable the `debug` feature to before you open a issue on GitHub.
+/// This will print the basic version information of the library when [`RMCP_LIB_INFO`] dropped.
+/// 
+/// Add this line on the top of your `main.rs` to print the debug information before the program exits.
+/// ```
+/// let _ = rmcp::debug_info();
+/// ```
+mod debug {
+    #[derive(Debug, Clone)]
+    pub struct RmcpLibInfo {
+        pub version_info: &'static str,
+        pub lastest_protocol: crate::model::ProtocolVersion,
+    }
+    impl RmcpLibInfo {
+        const fn global() -> Self {
+            Self {
+                version_info: git_version::git_version!(
+                    prefix = "git:",
+                    cargo_prefix = "cargo:",
+                    fallback = "unknown"
+                ),
+                lastest_protocol: crate::model::ProtocolVersion::LATEST,
+            }
+        }
+    }
+    impl Drop for RmcpLibInfo {
+        fn drop(&mut self) {
+            eprintln!("RMCP Version Info: {}", self.version_info);
+            eprintln!("RMCP Latest Protocol Version: {:?}", self.lastest_protocol);
+        }
+    }
+    pub static RMCP_LIB_INFO: RmcpLibInfo = RmcpLibInfo::global();
+    pub fn debug_info() -> RmcpLibInfo {
+        RMCP_LIB_INFO.clone()
+    }
+}
+
+#[cfg(feature = "debug")]
+pub use debug::{RMCP_LIB_INFO, debug_info};
