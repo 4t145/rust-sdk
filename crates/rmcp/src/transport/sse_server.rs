@@ -5,7 +5,7 @@ use axum::{
     extract::{Query, State},
     http::{StatusCode, request::Parts},
     response::{
-        Response,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
@@ -81,10 +81,25 @@ async fn post_event_handler(
     }
     Ok(StatusCode::ACCEPTED)
 }
-
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetEventQuery {
+    pub session_id: Option<String>,
+}
 async fn sse_handler(
     State(app): State<App>,
-) -> Result<Sse<impl Stream<Item = Result<Event, io::Error>>>, Response<String>> {
+    Query(GetEventQuery {
+        session_id: client_session_id,
+    }): Query<GetEventQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, io::Error>>>, Response> {
+    if client_session_id.is_some() {
+        // reject reconnect request
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "resume sse stream with session id are not supported yet.".to_string(),
+        )
+            .into_response());
+    };
     let session = session_id();
     tracing::info!(%session, "sse connection");
     use tokio_stream::{StreamExt, wrappers::ReceiverStream};
@@ -109,10 +124,11 @@ async fn sse_handler(
     let transport_send_result = app.transport_tx.send(transport);
     if transport_send_result.is_err() {
         tracing::warn!("send transport out error");
-        let mut response =
-            Response::new("fail to send out transport, it seems server is closed".to_string());
-        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        return Err(response);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fail to send out transport, it seems server is closed",
+        )
+            .into_response());
     }
     let post_path = app.post_path.as_ref();
     let ping_interval = app.sse_ping_interval;
