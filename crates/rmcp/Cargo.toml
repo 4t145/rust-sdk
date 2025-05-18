@@ -45,7 +45,11 @@ url = { version = "2.4", optional = true }
 # For tower compatibility
 tower-service = { version = "0.3", optional = true }
 
-
+# http-server
+http = { version = "1", optional = true  }
+http-body = { version = "1", optional = true  }
+http-body-util = { version = "0.1.3", optional = true  }
+bytes = { version = "1", optional = true }
 # for ws transport
 # tokio-tungstenite ={ version = "0.26", optional = true }
 
@@ -101,6 +105,10 @@ transport-streamable-http-server = [
     "transport-streamable-http-server-session",
     "axum",
     "uuid",
+    "dep:http",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:bytes"
 ]
 transport-streamable-http-server-session = [
     "transport-async-rw",
