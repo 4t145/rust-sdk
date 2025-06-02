@@ -245,9 +245,7 @@ impl<S, P> FromToolCallContextPart<S> for Parameters<P>
 where
     P: DeserializeOwned,
 {
-    fn from_tool_call_context_part(
-        context: &mut ToolCallContext<S>,
-    ) -> Result<Self, crate::Error> {
+    fn from_tool_call_context_part(context: &mut ToolCallContext<S>) -> Result<Self, crate::Error> {
         let arguments = context.arguments.take().unwrap_or_default();
         let value: P =
             serde_json::from_value(serde_json::Value::Object(arguments)).map_err(|e| {
@@ -261,18 +259,14 @@ where
 }
 
 impl<S> FromToolCallContextPart<S> for JsonObject {
-    fn from_tool_call_context_part(
-        context: &mut ToolCallContext<S>,
-    ) -> Result<Self, crate::Error> {
+    fn from_tool_call_context_part(context: &mut ToolCallContext<S>) -> Result<Self, crate::Error> {
         let object = context.arguments.take().unwrap_or_default();
         Ok(object)
     }
 }
 
 impl<S> FromToolCallContextPart<S> for crate::model::Extensions {
-    fn from_tool_call_context_part(
-        context: &mut ToolCallContext<S>,
-    ) -> Result<Self, crate::Error> {
+    fn from_tool_call_context_part(context: &mut ToolCallContext<S>) -> Result<Self, crate::Error> {
         let extensions = context.request_context.extensions.clone();
         Ok(extensions)
     }
@@ -284,9 +278,7 @@ impl<S, T> FromToolCallContextPart<S> for Extension<T>
 where
     T: Send + Sync + 'static + Clone,
 {
-    fn from_tool_call_context_part(
-        context: &mut ToolCallContext<S>,
-    ) -> Result<Self, crate::Error> {
+    fn from_tool_call_context_part(context: &mut ToolCallContext<S>) -> Result<Self, crate::Error> {
         let extension = context
             .request_context
             .extensions
@@ -302,7 +294,35 @@ where
     }
 }
 
-impl< S> ToolCallContext<S> {
+impl<S> FromToolCallContextPart<S> for crate::Peer<RoleServer> {
+    fn from_tool_call_context_part(context: &mut ToolCallContext<S>) -> Result<Self, crate::Error> {
+        let peer = context.request_context.peer.clone();
+        Ok(peer)
+    }
+}
+
+impl<S> FromToolCallContextPart<S> for crate::model::Meta {
+    fn from_tool_call_context_part(context: &mut ToolCallContext<S>) -> Result<Self, crate::Error> {
+        let mut meta = crate::model::Meta::default();
+        std::mem::swap(&mut meta, &mut context.request_context.meta);
+        Ok(meta)
+    }
+}
+
+pub struct RequestId(pub crate::model::RequestId);
+impl<S> FromToolCallContextPart<S> for RequestId {
+    fn from_tool_call_context_part(context: &mut ToolCallContext<S>) -> Result<Self, crate::Error> {
+        Ok(RequestId(context.request_context.id.clone()))
+    }
+}
+
+impl<S> FromToolCallContextPart<S> for RequestContext<RoleServer> {
+    fn from_tool_call_context_part(context: &mut ToolCallContext<S>) -> Result<Self, crate::Error> {
+        Ok(context.request_context.clone())
+    }
+}
+
+impl<S> ToolCallContext<S> {
     pub fn invoke<H, A>(self, h: H) -> H::Fut
     where
         H: CallToolHandler<S, A>,

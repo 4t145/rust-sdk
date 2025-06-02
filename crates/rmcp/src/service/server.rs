@@ -70,7 +70,7 @@ impl<S: Service<RoleServer>> ServiceExt<RoleServer> for S {
     ) -> impl Future<Output = Result<RunningService<RoleServer, Self>, ServerInitializeError<E>>> + Send
     where
         T: IntoTransport<RoleServer, E, A>,
-        E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
+        E: std::error::Error + Send + Sync + 'static,
         Self: Sized,
     {
         serve_server_with_ct(self, transport, ct)
@@ -84,7 +84,7 @@ pub async fn serve_server<S, T, E, A>(
 where
     S: Service<RoleServer>,
     T: IntoTransport<RoleServer, E, A>,
-    E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
     serve_server_with_ct(service, transport, CancellationToken::new()).await
 }
@@ -143,7 +143,7 @@ pub async fn serve_server_with_ct<S, T, E, A>(
 where
     S: Service<RoleServer>,
     T: IntoTransport<RoleServer, E, A>,
-    E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
     let mut transport = transport.into_transport();
     let id_provider = <Arc<AtomicU32RequestIdProvider>>::default();
@@ -210,9 +210,14 @@ where
             Some(ClientJsonRpcMessage::notification(notification)),
         ));
     };
-    let _ = service.handle_notification(notification).await;
+    let context = NotificationContext {
+        meta: notification.get_meta().clone(),
+        extensions: notification.extensions().clone(),
+        peer: peer.clone(),
+    };
+    let _ = service.handle_notification(notification, context).await;
     // Continue processing service
-    Ok(serve_inner(service, transport, peer, peer_rx, ct).await)
+    Ok(serve_inner(service, transport, peer, peer_rx, ct))
 }
 
 macro_rules! method {

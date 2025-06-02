@@ -7,7 +7,7 @@ Wait for the first release.
 <!-- [![Crates.io Version](todo)](todo) -->
 <!-- ![Release status](https://github.com/modelcontextprotocol/rust-sdk/actions/workflows/release.yml/badge.svg) -->
 <!-- [![docs.rs](todo)](todo) -->
-![Coverage](coverage.svg)
+![Coverage](docs/coverage.svg)
 
 An official rust Model Context Protocol SDK implementation with tokio async runtime.
 
@@ -107,8 +107,6 @@ let quit_reason = server.cancel().await?;
 </details>
 
 
-
-
 ## Examples
 
 See [examples](examples/README.md)
@@ -116,9 +114,6 @@ See [examples](examples/README.md)
 ## OAuth Support
 
 See [oauth_support](docs/OAUTH_SUPPORT.md) for details.
-
-
-
 
 
 ## Related Resources

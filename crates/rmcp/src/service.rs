@@ -76,7 +76,9 @@ pub trait ServiceRole: std::fmt::Debug + Send + Sync + 'static + Copy + Clone {
     type PeerResp: TransferObject;
     type PeerNot: TryInto<CancelledNotification, Error = Self::PeerNot>
         + From<CancelledNotification>
-        + TransferObject;
+        + TransferObject
+        + GetMeta
+        + GetExtensions;
     type InitializeError<E>;
     const IS_CLIENT: bool;
     type Info: TransferObject;
@@ -100,6 +102,7 @@ pub trait Service<R: ServiceRole>: Send + Sync + 'static {
     fn handle_notification(
         &self,
         notification: R::PeerNot,
+        context: NotificationContext<R>,
     ) -> impl Future<Output = Result<(), McpError>> + Send + '_;
     fn get_info(&self) -> R::Info;
 }
@@ -145,8 +148,9 @@ impl<R: ServiceRole> Service<R> for Box<dyn DynService<R>> {
     fn handle_notification(
         &self,
         notification: R::PeerNot,
+        context: NotificationContext<R>,
     ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
-        DynService::handle_notification(self.as_ref(), notification)
+        DynService::handle_notification(self.as_ref(), notification, context)
     }
 
     fn get_info(&self) -> R::Info {
@@ -160,7 +164,11 @@ pub trait DynService<R: ServiceRole>: Send + Sync {
         request: R::PeerReq,
         context: RequestContext<R>,
     ) -> BoxFuture<Result<R::Resp, McpError>>;
-    fn handle_notification(&self, notification: R::PeerNot) -> BoxFuture<Result<(), McpError>>;
+    fn handle_notification(
+        &self,
+        notification: R::PeerNot,
+        context: NotificationContext<R>,
+    ) -> BoxFuture<Result<(), McpError>>;
     fn get_info(&self) -> R::Info;
 }
 
@@ -172,8 +180,12 @@ impl<R: ServiceRole, S: Service<R>> DynService<R> for S {
     ) -> BoxFuture<Result<R::Resp, McpError>> {
         Box::pin(self.handle_request(request, context))
     }
-    fn handle_notification(&self, notification: R::PeerNot) -> BoxFuture<Result<(), McpError>> {
-        Box::pin(self.handle_notification(notification))
+    fn handle_notification(
+        &self,
+        notification: R::PeerNot,
+        context: NotificationContext<R>,
+    ) -> BoxFuture<Result<(), McpError>> {
+        Box::pin(self.handle_notification(notification, context))
     }
     fn get_info(&self) -> R::Info {
         self.get_info()
@@ -424,14 +436,14 @@ pub struct RunningService<R: ServiceRole, S: Service<R>> {
     service: Arc<S>,
     peer: Peer<R>,
     handle: tokio::task::JoinHandle<QuitReason>,
-    /// cancellation token with drop guard
+    cancellation_token: CancellationToken,
     dg: DropGuard,
 }
 impl<R: ServiceRole, S: Service<R>> Deref for RunningService<R, S> {
     type Target = Peer<R>;
 
     fn deref(&self) -> &Self::Target {
-        self.peer()
+        &self.peer
     }
 }
 
@@ -444,6 +456,11 @@ impl<R: ServiceRole, S: Service<R>> RunningService<R, S> {
     pub fn service(&self) -> &S {
         self.service.as_ref()
     }
+    #[inline]
+    pub fn cancellation_token(&self) -> RunningServiceCancellationToken {
+        RunningServiceCancellationToken(self.cancellation_token.clone())
+    }
+    #[inline]
     pub async fn waiting(self) -> Result<QuitReason, tokio::task::JoinError> {
         self.handle.await
     }
@@ -451,6 +468,15 @@ impl<R: ServiceRole, S: Service<R>> RunningService<R, S> {
         let RunningService { dg, handle, .. } = self;
         dg.disarm().cancel();
         handle.await
+    }
+}
+
+// use a wrapper type so we can tweak the implementation if needed
+pub struct RunningServiceCancellationToken(CancellationToken);
+
+impl RunningServiceCancellationToken {
+    pub fn cancel(self) {
+        self.0.cancel();
     }
 }
 
@@ -473,8 +499,17 @@ pub struct RequestContext<R: ServiceRole> {
     pub peer: Peer<R>,
 }
 
+/// Request execution context
+#[derive(Debug, Clone)]
+pub struct NotificationContext<R: ServiceRole> {
+    pub meta: Meta,
+    pub extensions: Extensions,
+    /// An interface to fetch the remote client or server
+    pub peer: Peer<R>,
+}
+
 /// Use this function to skip initialization process
-pub async fn serve_directly<R, S, T, E, A>(
+pub fn serve_directly<R, S, T, E, A>(
     service: S,
     transport: T,
     peer_info: Option<R::PeerInfo>,
@@ -485,11 +520,11 @@ where
     T: IntoTransport<R, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    serve_directly_with_ct(service, transport, peer_info, Default::default()).await
+    serve_directly_with_ct(service, transport, peer_info, Default::default())
 }
 
 /// Use this function to skip initialization process
-pub async fn serve_directly_with_ct<R, S, T, E, A>(
+pub fn serve_directly_with_ct<R, S, T, E, A>(
     service: S,
     transport: T,
     peer_info: Option<R::PeerInfo>,
@@ -502,11 +537,11 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     let (peer, peer_rx) = Peer::new(Arc::new(AtomicU32RequestIdProvider::default()), peer_info);
-    serve_inner(service, transport, peer, peer_rx, ct).await
+    serve_inner(service, transport, peer, peer_rx, ct)
 }
 
 #[instrument(skip_all)]
-async fn serve_inner<R, S, T, E, A>(
+fn serve_inner<R, S, T, E, A>(
     service: S,
     transport: T,
     peer: Peer<R>,
@@ -696,7 +731,9 @@ where
                     }));
                 }
                 Event::PeerMessage(JsonRpcMessage::Request(JsonRpcRequest {
-                    id, request, ..
+                    id,
+                    mut request,
+                    ..
                 })) => {
                     tracing::debug!(%id, ?request, "received request");
                     {
@@ -705,12 +742,17 @@ where
                         let request_ct = serve_loop_ct.child_token();
                         let context_ct = request_ct.child_token();
                         local_ct_pool.insert(id.clone(), request_ct);
+                        let mut extensions = Extensions::new();
+                        let mut meta = Meta::new();
+                        // avoid clone
+                        std::mem::swap(&mut extensions, request.extensions_mut());
+                        std::mem::swap(&mut meta, request.get_meta_mut());
                         let context = RequestContext {
                             ct: context_ct,
                             id: id.clone(),
                             peer: peer.clone(),
-                            meta: request.get_meta().clone(),
-                            extensions: request.extensions().clone(),
+                            meta,
+                            extensions,
                         };
                         tokio::spawn(async move {
                             let result = service.handle_request(request, context).await;
@@ -734,7 +776,7 @@ where
                 })) => {
                     tracing::info!(?notification, "received notification");
                     // catch cancelled notification
-                    let notification = match notification.try_into() {
+                    let mut notification = match notification.try_into() {
                         Ok::<CancelledNotification, _>(cancelled) => {
                             if let Some(ct) = local_ct_pool.remove(&cancelled.params.request_id) {
                                 tracing::info!(id = %cancelled.params.request_id, reason = cancelled.params.reason, "cancelled");
@@ -746,8 +788,18 @@ where
                     };
                     {
                         let service = shared_service.clone();
+                        let mut extensions = Extensions::new();
+                        let mut meta = Meta::new();
+                        // avoid clone
+                        std::mem::swap(&mut extensions, notification.extensions_mut());
+                        std::mem::swap(&mut meta, notification.get_meta_mut());
+                        let context = NotificationContext {
+                            peer: peer.clone(),
+                            meta,
+                            extensions,
+                        };
                         tokio::spawn(async move {
-                            let result = service.handle_notification(notification).await;
+                            let result = service.handle_notification(notification, context).await;
                             if let Err(error) = result {
                                 tracing::warn!(%error, "Error sending notification");
                             }
@@ -801,6 +853,7 @@ where
         service,
         peer: peer_return,
         handle,
+        cancellation_token: ct.clone(),
         dg: ct.drop_guard(),
     }
 }
