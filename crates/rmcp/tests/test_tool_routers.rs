@@ -1,15 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
 use rmcp::{
-    RoleServer, ServerHandler, Service,
     handler::server::{
         router::{
-            Router,
-            tool::{CallToolHandlerExt, ToolRoute, ToolRouter},
+            tool::{CallToolHandlerExt, ToolRoute, ToolRouteWithType, ToolRouter}, Router
         },
-        tool::{Parameters, schema_for_type},
-    },
-    model::{Extensions, Tool},
+        tool::{schema_for_type, Parameters},
+    }, model::{Extensions, Tool}, RoleServer, ServerHandler, Service
 };
 
 #[derive(Debug, Default)]
@@ -69,6 +66,8 @@ fn assert_service<S: Service<RoleServer>>(service: S) {
 
 #[test]
 fn test_tool_router() {
+    for flag in inventory::iter::<ToolRouteWithType> {
+    }
     let test_handler = TestHandler::<()>::default();
     fn tool(name: &'static str) -> Tool {
         Tool::new(name, name, schema_for_type::<Request>())

@@ -5,6 +5,7 @@ use tool::{IntoToolRoute, ToolRoute};
 use crate::{
     RoleServer, Service,
     model::{ClientRequest, ListToolsResult, ServerResult},
+    service::NotificationContext,
 };
 
 use super::ServerHandler;
@@ -35,8 +36,7 @@ where
         self
     }
 
-    pub fn with_tools(mut self, routes: impl IntoIterator<Item = ToolRoute<S>>) -> Self
-    {
+    pub fn with_tools(mut self, routes: impl IntoIterator<Item = ToolRoute<S>>) -> Self {
         for route in routes {
             self.tool_router.add(route);
         }
@@ -51,8 +51,11 @@ where
     async fn handle_notification(
         &self,
         notification: <RoleServer as crate::service::ServiceRole>::PeerNot,
+        context: NotificationContext<RoleServer>,
     ) -> Result<(), crate::Error> {
-        self.service.handle_notification(notification).await
+        self.service
+            .handle_notification(notification, context)
+            .await
     }
     async fn handle_request(
         &self,

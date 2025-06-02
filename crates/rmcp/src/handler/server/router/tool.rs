@@ -1,4 +1,7 @@
+use std::any::{Any, TypeId};
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use schemars::JsonSchema;
@@ -9,10 +12,110 @@ use crate::handler::server::tool::{
     CallToolHandler, DynCallToolHandler, ToolCallContext, schema_for_type,
 };
 
+inventory::collect!(ToolRouteWithType);
+
+#[derive(Debug, Default)]
+pub struct GlobalStaticRouters {
+    pub routers:
+        std::sync::OnceLock<tokio::sync::RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
+}
+
+impl GlobalStaticRouters {
+    pub fn global() -> &'static Self {
+        static GLOBAL: GlobalStaticRouters = GlobalStaticRouters {
+            routers: std::sync::OnceLock::new(),
+        };
+        &GLOBAL
+    }
+    pub async fn set<S: Send + Sync + 'static>(
+        router: Arc<ToolRouter<S>>,
+    ) -> Result<(), String> {
+        let routers = Self::global().routers.get_or_init(Default::default);
+        let mut routers_wg = routers.write().await;
+        if routers_wg.insert(TypeId::of::<S>(), router).is_some() {
+            return Err("Router already exists".to_string());
+        }
+        Ok(())
+    }
+    pub async fn get<S: Send + Sync + 'static>() -> Arc<ToolRouter<S>> {
+        let routers = Self::global().routers.get_or_init(Default::default);
+        let routers_rg = routers.read().await;
+        if let Some(router) = routers_rg.get(&TypeId::of::<S>()) {
+            return router
+                .clone()
+                .downcast::<ToolRouter<S>>()
+                .expect("Failed to downcast");
+        }
+        {
+            drop(routers_rg);
+        }
+        let mut routers = routers.write().await;
+        match routers.entry(TypeId::of::<S>()) {
+            std::collections::hash_map::Entry::Occupied(occupied) => occupied
+                .get()
+                .clone()
+                .downcast::<ToolRouter<S>>()
+                .expect("Failed to downcast"),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let mut router = ToolRouter::<S>::default();
+                for route in inventory::iter::<ToolRouteWithType>
+                    .into_iter()
+                    .filter(|r| r.type_id == TypeId::of::<S>())
+                {
+                    if let Some(route) = route.downcast::<S>() {
+                        router.add(route.clone());
+                    }
+                }
+                let mut_ref = vacant.insert(Arc::new(router));
+                mut_ref
+                    .downcast_ref()
+                    .cloned()
+                    .expect("Failed to downcast after insert")
+            }
+        }
+    }
+}
+
+pub struct ToolRouteWithType {
+    type_id: TypeId,
+    route: Box<dyn Any + Send + Sync>,
+}
+
+impl ToolRouteWithType {
+    pub fn downcast<S: 'static>(&self) -> Option<&ToolRoute<S>> {
+        if self.type_id == TypeId::of::<S>() {
+            self.route.downcast_ref::<ToolRoute<S>>()
+        } else {
+            None
+        }
+    }
+    pub fn from_tool_route<S: 'static>(route: ToolRoute<S>) -> Self {
+        Self {
+            type_id: TypeId::of::<S>(),
+            route: Box::new(route),
+        }
+    }
+}
+
+impl<S: 'static> From<ToolRoute<S>> for ToolRouteWithType {
+    fn from(value: ToolRoute<S>) -> Self {
+        Self::from_tool_route(value)
+    }
+}
+
 pub struct ToolRoute<S> {
     #[allow(clippy::type_complexity)]
-    pub call: Box<DynCallToolHandler<S>>,
+    pub call: Arc<DynCallToolHandler<S>>,
     pub attr: crate::model::Tool,
+}
+
+impl<S> Clone for ToolRoute<S> {
+    fn clone(&self) -> Self {
+        Self {
+            call: self.call.clone(),
+            attr: self.attr.clone(),
+        }
+    }
 }
 
 impl<S: Send + Sync + 'static> ToolRoute<S> {
@@ -22,7 +125,7 @@ impl<S: Send + Sync + 'static> ToolRoute<S> {
         <C as CallToolHandler<S, A>>::Fut: 'static,
     {
         Self {
-            call: Box::new(move |context: ToolCallContext<S>| {
+            call: Arc::new(move |context: ToolCallContext<S>| {
                 let call = call.clone();
                 Box::pin(async move { context.invoke(call).await })
             }),
@@ -37,7 +140,7 @@ impl<S: Send + Sync + 'static> ToolRoute<S> {
             + 'static,
     {
         Self {
-            call: Box::new(call),
+            call: Arc::new(call),
             attr: attr.into(),
         }
     }
@@ -152,12 +255,28 @@ where
     }
 }
 
-#[derive(Default)]
 pub struct ToolRouter<S> {
     #[allow(clippy::type_complexity)]
     pub map: std::collections::HashMap<Cow<'static, str>, ToolRoute<S>>,
 
     pub transparent_when_not_found: bool,
+}
+
+impl<S> Default for ToolRouter<S> {
+    fn default() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            transparent_when_not_found: false,
+        }
+    }
+}
+impl<S> Clone for ToolRouter<S> {
+    fn clone(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+            transparent_when_not_found: self.transparent_when_not_found,
+        }
+    }
 }
 
 impl<S> IntoIterator for ToolRouter<S> {
