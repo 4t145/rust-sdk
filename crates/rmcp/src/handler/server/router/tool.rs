@@ -122,12 +122,11 @@ impl<S: Send + Sync + 'static> ToolRoute<S> {
     pub fn new<C, A>(attr: impl Into<Tool>, call: C) -> Self
     where
         C: CallToolHandler<S, A> + Send + Sync + Clone + 'static,
-        <C as CallToolHandler<S, A>>::Fut: 'static,
     {
         Self {
             call: Arc::new(move |context: ToolCallContext<S>| {
                 let call = call.clone();
-                Box::pin(async move { context.invoke(call).await })
+                Box::pin(context.invoke(call))
             }),
             attr: attr.into(),
         }
@@ -158,7 +157,6 @@ where
     S: Send + Sync + 'static,
     C: CallToolHandler<S, A> + Send + Sync + Clone + 'static,
     T: Into<Tool>,
-    <C as CallToolHandler<S, A>>::Fut: 'static,
 {
     fn into_tool_route(self) -> ToolRoute<S> {
         ToolRoute::new(self.0.into(), self.1)
@@ -188,7 +186,6 @@ where
 pub trait CallToolHandlerExt<S, A>: Sized
 where
     Self: CallToolHandler<S, A> + Send + Sync + Clone + 'static,
-    <Self as CallToolHandler<S, A>>::Fut: 'static,
 {
     fn name(self, name: impl Into<Cow<'static, str>>) -> WithToolAttr<Self, S, A>;
 }
@@ -196,7 +193,6 @@ where
 impl<C, S, A> CallToolHandlerExt<S, A> for C
 where
     C: CallToolHandler<S, A> + Send + Sync + Clone + 'static,
-    <C as CallToolHandler<S, A>>::Fut: 'static,
 {
     fn name(self, name: impl Into<Cow<'static, str>>) -> WithToolAttr<Self, S, A> {
         WithToolAttr {
@@ -214,7 +210,6 @@ where
 pub struct WithToolAttr<C, S, A>
 where
     C: CallToolHandler<S, A> + Send + Sync + Clone + 'static,
-    <C as CallToolHandler<S, A>>::Fut: 'static,
 {
     pub attr: crate::model::Tool,
     pub call: C,
@@ -224,7 +219,6 @@ where
 impl<C, S, A> IntoToolRoute<S, A> for WithToolAttr<C, S, A>
 where
     C: CallToolHandler<S, A> + Send + Sync + Clone + 'static,
-    <C as CallToolHandler<S, A>>::Fut: 'static,
     S: Send + Sync + 'static,
 {
     fn into_tool_route(self) -> ToolRoute<S> {
@@ -235,7 +229,6 @@ where
 impl<C, S, A> WithToolAttr<C, S, A>
 where
     C: CallToolHandler<S, A> + Send + Sync + Clone + 'static,
-    <C as CallToolHandler<S, A>>::Fut: 'static,
 {
     pub fn description(mut self, description: impl Into<Cow<'static, str>>) -> Self {
         self.attr.description = Some(description.into());
@@ -301,7 +294,6 @@ where
     pub fn with<C, A>(mut self, attr: crate::model::Tool, call: C) -> Self
     where
         C: CallToolHandler<S, A> + Send + Sync + Clone + 'static,
-        <C as CallToolHandler<S, A>>::Fut: 'static,
     {
         self.add(ToolRoute::new(attr, call));
         self
@@ -317,7 +309,7 @@ where
     pub fn has(&self, name: &str) -> bool {
         self.map.contains_key(name)
     }
-    pub async fn call(&self, context: ToolCallContext<S>) -> Result<CallToolResult, crate::Error> {
+    pub async fn call(&self, context: ToolCallContext<'_, S>) -> Result<CallToolResult, crate::Error> {
         let item = self
             .map
             .get(context.name())

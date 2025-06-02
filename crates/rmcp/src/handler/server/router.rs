@@ -68,7 +68,7 @@ where
                     || !self.tool_router.transparent_when_not_found
                 {
                     let tool_call_context = crate::handler::server::tool::ToolCallContext::new(
-                        self.service.clone(),
+                        self.service.as_ref(),
                         request.params,
                         context,
                     );
