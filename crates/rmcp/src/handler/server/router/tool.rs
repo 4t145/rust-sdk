@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use futures::FutureExt;
 use schemars::JsonSchema;
 
 use crate::model::{CallToolResult, Tool, ToolAnnotations};
@@ -126,14 +127,14 @@ impl<S: Send + Sync + 'static> ToolRoute<S> {
         Self {
             call: Arc::new(move |context: ToolCallContext<S>| {
                 let call = call.clone();
-                Box::pin(context.invoke(call))
+                context.invoke(call).boxed()
             }),
             attr: attr.into(),
         }
     }
     pub fn new_dyn<C>(attr: impl Into<Tool>, call: C) -> Self
     where
-        C: Fn(ToolCallContext<S>) -> BoxFuture<'static, Result<CallToolResult, crate::Error>>
+        C: for<'a> Fn(ToolCallContext<'a, S>) -> BoxFuture<'a, Result<CallToolResult, crate::Error>>
             + Send
             + Sync
             + 'static,
@@ -309,7 +310,7 @@ where
     pub fn has(&self, name: &str) -> bool {
         self.map.contains_key(name)
     }
-    pub async fn call(&self, context: ToolCallContext<'_, S>) -> Result<CallToolResult, crate::Error> {
+    pub async fn call<'c>(&self, context: ToolCallContext<'c, S>) -> Result<CallToolResult, crate::Error> {
         let item = self
             .map
             .get(context.name())

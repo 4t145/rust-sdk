@@ -2,7 +2,7 @@ use std::{
     any::TypeId, borrow::Cow, collections::HashMap, future::Ready, marker::PhantomData, sync::Arc,
 };
 
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, FutureExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
@@ -162,11 +162,13 @@ impl IntoCallToolResult for Result<CallToolResult, crate::Error> {
 }
 
 pub trait CallToolHandler<S, A> {
-    type Fut<'a>: Future<Output = Result<CallToolResult, crate::Error>> + Send + 'static where S: 'a;
-    fn call(self, context: ToolCallContext<'_, S>) -> Self::Fut<'_>;
+    fn call<'s>(
+        self,
+        context: ToolCallContext<'s, S>,
+    ) -> BoxFuture<'s, Result<CallToolResult, crate::Error>>;
 }
 
-pub type DynCallToolHandler<S> = dyn Fn(ToolCallContext<S>) -> BoxFuture<'static, Result<CallToolResult, crate::Error>>
+pub type DynCallToolHandler<S> = dyn for<'s> Fn(ToolCallContext<'s, S>) -> BoxFuture<'s, Result<CallToolResult, crate::Error>>
     + Send
     + Sync;
 
@@ -316,20 +318,18 @@ impl<S> FromToolCallContextPart<S> for RequestContext<RoleServer> {
 }
 
 impl<'s, S> ToolCallContext<'s, S> {
-    pub fn invoke<H, A>(self, h: H) -> H::Fut<'s>
+    pub fn invoke<H, A>(self, h: H) -> BoxFuture<'s, Result<CallToolResult, crate::Error>>
     where
         H: CallToolHandler<S, A>,
     {
         h.call(self)
     }
 }
-
 #[allow(clippy::type_complexity)]
 pub struct AsyncAdapter<P, Fut, R>(PhantomData<fn(P) -> fn(Fut) -> R>);
 pub struct SyncAdapter<P, R>(PhantomData<fn(P) -> R>);
-
 // #[allow(clippy::type_complexity)]
-pub struct AsyncMethodAdapter<P, Fut, R>(PhantomData<(fn(P) -> Fut, fn(Fut) -> R)>);
+pub struct AsyncMethodAdapter<P, R>(PhantomData<fn(P) -> R>);
 pub struct SyncMethodAdapter<P, R>(PhantomData<fn(P) -> R>);
 
 macro_rules! impl_for {
@@ -345,37 +345,36 @@ macro_rules! impl_for {
         impl_for!([$($Tn)* $Tn_1] [$($Rest)*]);
     };
     (@impl $($Tn: ident)*) => {
-        impl<$($Tn,)* S, F, Fut, R> CallToolHandler<S, AsyncMethodAdapter<($($Tn,)*), Fut, R>> for F
+        impl<$($Tn,)* S, F,  R> CallToolHandler<S, AsyncMethodAdapter<($($Tn,)*), R>> for F
         where
             $(
                 $Tn: FromToolCallContextPart<S> ,
             )*
-            F: FnOnce(&S, $($Tn,)*) -> Fut + Send + 'static,
-            Fut: Future<Output = R> + Send + 'static,
+            F: FnOnce(&S, $($Tn,)*) -> BoxFuture<'_, R>,
+
+            // Need RTN support here(I guess), https://github.com/rust-lang/rust/pull/138424
+            // Fut: Future<Output = R> + Send + 'a,
             R: IntoCallToolResult + Send + 'static,
             S: Send + Sync + 'static,
         {
-            type Fut<'s> = IntoCallToolResultFut<Fut, R> ;
             #[allow(unused_variables, non_snake_case, unused_mut)]
             fn call(
                 self,
                 mut context: ToolCallContext<'_, S>,
-            ) -> Self::Fut<'_> {
+            ) -> BoxFuture<'_, Result<CallToolResult, crate::Error>>{
                 $(
                     let result = $Tn::from_tool_call_context_part(&mut context);
                     let $Tn = match result {
                         Ok(value) => value,
-                        Err(e) => return IntoCallToolResultFut::Ready {
-                            result: std::future::ready(Err(e)),
-                        },
+                        Err(e) => return std::future::ready(Err(e)).boxed(),
                     };
                 )*
                 let service = context.service;
                 let fut = self(service, $($Tn,)*);
-                IntoCallToolResultFut::Pending {
-                    fut,
-                    _marker: PhantomData
-                }
+                async move {
+                    let result = fut.await;
+                    result.into_call_tool_result()
+                }.boxed()
             }
         }
 
@@ -389,25 +388,23 @@ macro_rules! impl_for {
             R: IntoCallToolResult + Send + 'static,
             S: Send + Sync,
         {
-            type Fut<'s> = IntoCallToolResultFut<Fut, R> where S: 's;
             #[allow(unused_variables, non_snake_case, unused_mut)]
             fn call(
                 self,
                 mut context: ToolCallContext<S>,
-            ) -> Self::Fut<'_> {
+            ) -> BoxFuture<'static, Result<CallToolResult, crate::Error>>{
                 $(
                     let result = $Tn::from_tool_call_context_part(&mut context);
                     let $Tn = match result {
                         Ok(value) => value,
-                        Err(e) => return IntoCallToolResultFut::Ready {
-                            result: std::future::ready(Err(e)),
-                        },
+                        Err(e) => return std::future::ready(Err(e)).boxed(),
                     };
                 )*
-                IntoCallToolResultFut::Pending {
-                    fut: self($($Tn,)*),
-                    _marker: PhantomData
-                }
+                let fut = self($($Tn,)*);
+                async move {
+                    let result = fut.await;
+                    result.into_call_tool_result()
+                }.boxed()
             }
         }
 
@@ -420,20 +417,19 @@ macro_rules! impl_for {
             R: IntoCallToolResult + Send + ,
             S: Send + Sync,
         {
-            type Fut<'s> = Ready<Result<CallToolResult, crate::Error>> where S: 's;
             #[allow(unused_variables, non_snake_case, unused_mut)]
             fn call(
                 self,
                 mut context: ToolCallContext<S>,
-            ) -> Self::Fut<'_> {
+            ) -> BoxFuture<'static, Result<CallToolResult, crate::Error>> {
                 $(
                     let result = $Tn::from_tool_call_context_part(&mut context);
                     let $Tn = match result {
                         Ok(value) => value,
-                        Err(e) => return std::future::ready(Err(e)),
+                        Err(e) => return std::future::ready(Err(e)).boxed(),
                     };
                 )*
-                std::future::ready(self(context.service, $($Tn,)*).into_call_tool_result())
+                std::future::ready(self(context.service, $($Tn,)*).into_call_tool_result()).boxed()
             }
         }
 
@@ -446,48 +442,47 @@ macro_rules! impl_for {
             R: IntoCallToolResult + Send + ,
             S: Send + Sync,
         {
-            type Fut<'s> = Ready<Result<CallToolResult, crate::Error>> where S: 's;
             #[allow(unused_variables, non_snake_case, unused_mut)]
             fn call(
                 self,
                 mut context: ToolCallContext<S>,
-            ) -> Self::Fut<'_> {
+            ) -> BoxFuture<'static, Result<CallToolResult, crate::Error>>  {
                 $(
                     let result = $Tn::from_tool_call_context_part(&mut context);
                     let $Tn = match result {
                         Ok(value) => value,
-                        Err(e) => return std::future::ready(Err(e)),
+                        Err(e) => return std::future::ready(Err(e)).boxed(),
                     };
                 )*
-                std::future::ready(self($($Tn,)*).into_call_tool_result())
+                std::future::ready(self($($Tn,)*).into_call_tool_result()).boxed()
             }
         }
     };
 }
 impl_for!(T0 T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15);
-pub struct ToolBoxItem<S> {
-    #[allow(clippy::type_complexity)]
-    pub call: Box<DynCallToolHandler<S>>,
-    pub attr: crate::model::Tool,
-}
+// pub struct ToolBoxItem<S> {
+//     #[allow(clippy::type_complexity)]
+//     pub call: Box<DynCallToolHandler<S>>,
+//     pub attr: crate::model::Tool,
+// }
 
-impl<S: Send + Sync + 'static + Clone> ToolBoxItem<S> {
-    pub fn new<C>(attr: crate::model::Tool, call: C) -> Self
-    where
-        C: Fn(ToolCallContext<S>) -> BoxFuture<'static, Result<CallToolResult, crate::Error>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        Self {
-            call: Box::new(call),
-            attr,
-        }
-    }
-    pub fn name(&self) -> &str {
-        &self.attr.name
-    }
-}
+// impl<S: Send + Sync + 'static + Clone> ToolBoxItem<S> {
+//     pub fn new<C>(attr: crate::model::Tool, call: C) -> Self
+//     where
+//         C: Fn(ToolCallContext<'a, S>) -> BoxFuture<'static, Result<CallToolResult, crate::Error>>
+//             + Send
+//             + Sync
+//             + 'static,
+//     {
+//         Self {
+//             call: Box::new(call),
+//             attr,
+//         }
+//     }
+//     pub fn name(&self) -> &str {
+//         &self.attr.name
+//     }
+// }
 
 // #[derive(Default)]
 // pub struct ToolBox<S> {
