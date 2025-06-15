@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use rmcp::{ServerHandler, tool};
+    use rmcp::{ServerHandler, tool, tool2};
 
     #[derive(Debug, Clone, Default)]
     pub struct AnnotatedServer {}
@@ -9,7 +9,7 @@ mod tests {
         // Tool with inline comments for documentation
         /// Direct annotation test tool
         /// This is used to test tool annotations
-        #[tool(
+        #[tool2(
             name = "direct-annotated-tool",
             annotations = {
                 title: "Annotated Tool", 
