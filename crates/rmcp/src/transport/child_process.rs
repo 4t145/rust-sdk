@@ -48,6 +48,13 @@ pin_project_lite::pin_project! {
     }
 }
 
+impl TokioChildProcessOut {
+    /// Get the process ID of the child process.
+    pub fn id(&self) -> Option<u32> {
+        self.child.inner.id()
+    }
+}
+
 impl AsyncRead for TokioChildProcessOut {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -59,11 +66,12 @@ impl AsyncRead for TokioChildProcessOut {
 }
 
 impl TokioChildProcess {
-    pub fn new(mut command: tokio::process::Command) -> std::io::Result<Self> {
-        command
+    pub fn new(command: impl Into<TokioCommandWrap>) -> std::io::Result<Self> {
+        let mut command_wrap = command.into();
+        command_wrap
+            .command_mut()
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
-        let mut command_wrap = TokioCommandWrap::from(command);
         #[cfg(unix)]
         command_wrap.wrap(process_wrap::tokio::ProcessGroup::leader());
         #[cfg(windows)]
@@ -74,6 +82,11 @@ impl TokioChildProcess {
             child_stdin,
             child_stdout,
         })
+    }
+
+    /// Get the process ID of the child process.
+    pub fn id(&self) -> Option<u32> {
+        self.child.inner.id()
     }
 
     pub fn split(self) -> (TokioChildProcessOut, ChildStdin) {
