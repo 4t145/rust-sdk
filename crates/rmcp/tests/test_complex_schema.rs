@@ -31,7 +31,7 @@ impl Demo {
     pub fn new() -> Self {
         Self
     }
-
+    
     #[tool(description = "LLM")]
     async fn chat(
         &self,

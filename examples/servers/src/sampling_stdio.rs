@@ -120,6 +120,7 @@ impl ServerHandler for SamplingDemoServer {
                     .unwrap(),
                 ),
                 annotations: None,
+                output_schema: None,
             }],
             next_cursor: None,
         })

@@ -58,6 +58,8 @@ pub struct ClientCapabilities {
     pub roots: Option<RootsCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling: Option<JsonObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<JsonObject>,
 }
 
 ///
@@ -252,6 +254,7 @@ builder! {
         experimental: ExperimentalCapabilities,
         roots: RootsCapabilities,
         sampling: JsonObject,
+        elicitation: JsonObject,
     }
 }
 
@@ -295,7 +298,8 @@ mod test {
             .enable_experimental()
             .enable_roots()
             .enable_roots_list_changed()
-            .enable_sampling();
+            .enable_sampling()
+            .enable_elicitation();
         assert_eq!(
             client_builder.experimental,
             Some(ExperimentalCapabilities::default())

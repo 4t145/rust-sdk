@@ -20,6 +20,9 @@ pub struct Tool {
     /// A JSON Schema object defining the expected parameters for the tool
     pub input_schema: Arc<JsonObject>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// A JSON Schema object defining the expected parameters for the tool
+    pub output_schema: Option<Arc<JsonObject>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional additional tool information.
     pub annotations: Option<ToolAnnotations>,
 }
@@ -136,6 +139,7 @@ impl Tool {
             name: name.into(),
             description: Some(description.into()),
             input_schema: input_schema.into(),
+            output_schema: None,
             annotations: None,
         }
     }

@@ -21,6 +21,10 @@ impl<H: ClientHandler> Service<RoleClient> for H {
                 .list_roots(context)
                 .await
                 .map(ClientResult::ListRootsResult),
+            ServerRequest::ElicitRequest(request) => self
+                .elicit(request.params, context)
+                .await
+                .map(ClientResult::ElicitResult),
         }
     }
 
@@ -84,6 +88,14 @@ pub trait ClientHandler: Sized + Send + Sync + 'static {
         context: RequestContext<RoleClient>,
     ) -> impl Future<Output = Result<ListRootsResult, McpError>> + Send + '_ {
         std::future::ready(Ok(ListRootsResult::default()))
+    }
+
+    fn elicit(
+        &self,
+        params: ElicitRequestParams,
+        context: RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<ElicitResult, McpError>> + Send + '_ {
+        std::future::ready(Err(McpError::method_not_found::<ElicitRequestMethod>()))
     }
 
     fn on_cancelled(

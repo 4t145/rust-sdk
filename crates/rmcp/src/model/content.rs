@@ -23,6 +23,7 @@ pub struct RawImageContent {
 }
 
 pub type ImageContent = Annotated<RawImageContent>;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -57,6 +58,7 @@ pub enum RawContent {
     Text(RawTextContent),
     Image(RawImageContent),
     Resource(RawEmbeddedResource),
+    ResourceLink,
     Audio(AudioContent),
 }
 
@@ -88,6 +90,10 @@ impl RawContent {
 
     pub fn resource(resource: ResourceContents) -> Self {
         RawContent::Resource(RawEmbeddedResource { resource })
+    }
+
+    pub const fn resource_link() -> Self {
+        RawContent::ResourceLink
     }
 
     pub fn embedded_text<S: Into<String>, T: Into<String>>(uri: S, content: T) -> Self {

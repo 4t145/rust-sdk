@@ -2,6 +2,7 @@ use std::{borrow::Cow, sync::Arc};
 mod annotated;
 mod capabilities;
 mod content;
+mod elication;
 mod extension;
 mod meta;
 mod prompt;
@@ -142,6 +143,7 @@ impl std::fmt::Display for ProtocolVersion {
 }
 
 impl ProtocolVersion {
+    pub const V_2025_06_18: Self = Self(Cow::Borrowed("2025-06-18"));
     pub const V_2025_03_26: Self = Self(Cow::Borrowed("2025-03-26"));
     pub const V_2024_11_05: Self = Self(Cow::Borrowed("2024-11-05"));
     pub const LATEST: Self = Self::V_2025_03_26;
@@ -164,6 +166,7 @@ impl<'de> Deserialize<'de> for ProtocolVersion {
         let s: String = Deserialize::deserialize(deserializer)?;
         #[allow(clippy::single_match)]
         match s.as_str() {
+            "2025-06-18" => return Ok(ProtocolVersion::V_2025_06_18),
             "2024-11-05" => return Ok(ProtocolVersion::V_2024_11_05),
             "2025-03-26" => return Ok(ProtocolVersion::V_2025_03_26),
             _ => {}
@@ -1097,10 +1100,22 @@ pub struct ModelHint {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CompleteRequestParam {
     pub r#ref: Reference,
+    /// The argument's information
     pub argument: ArgumentInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Additional, optional context for completions
+    pub context: Option<CompleteRequestContext>
 }
 
 pub type CompleteRequest = Request<CompleteRequestMethod, CompleteRequestParam>;
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct CompleteRequestContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<std::collections::HashMap<String, String>>,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -1275,6 +1290,39 @@ pub struct GetPromptResult {
 }
 
 // =============================================================================
+// ELICATION
+// =============================================================================
+const_string!(ElicitRequestMethod = "elicitation/request");
+pub type ElicitRequest = Request<ElicitRequestMethod, ElicitRequestParams>;
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitRequestParams {
+    message: String,
+    requested_schema: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitResult {
+    action: ElicitAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum ElicitAction {
+    Accept,
+    Decline,
+    #[default]
+    Cancel,
+}
+
+// =============================================================================
 // MESSAGE TYPE UNIONS
 // =============================================================================
 
@@ -1318,7 +1366,7 @@ ts_union!(
 );
 
 ts_union!(
-    export type ClientResult = CreateMessageResult | ListRootsResult | EmptyResult;
+    export type ClientResult = CreateMessageResult | ListRootsResult | EmptyResult | ElicitResult;
 );
 
 impl ClientResult {
@@ -1333,7 +1381,8 @@ ts_union!(
     export type ServerRequest =
     | PingRequest
     | CreateMessageRequest
-    | ListRootsRequest;
+    | ListRootsRequest
+    | ElicitRequest;
 );
 
 ts_union!(

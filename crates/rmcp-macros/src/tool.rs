@@ -10,6 +10,9 @@ pub struct ToolAttribute {
     pub description: Option<String>,
     /// A JSON Schema object defining the expected parameters for the tool
     pub input_schema: Option<Expr>,
+    /// An optional JSON Schema object defining the structure of the tool's output returned in
+    /// the structuredContent field of a CallToolResult.
+    pub output_schema: Option<Expr>,
     /// Optional additional tool information.
     pub annotations: Option<ToolAnnotationsAttribute>,
 }
@@ -18,6 +21,7 @@ pub struct ResolvedToolAttribute {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Expr,
+    pub output_schema: Expr,
     pub annotations: Expr,
 }
 
@@ -27,6 +31,7 @@ impl ResolvedToolAttribute {
             name,
             description,
             input_schema,
+            output_schema,
             annotations,
         } = self;
         let description = if let Some(description) = description {
@@ -41,6 +46,7 @@ impl ResolvedToolAttribute {
                     description: #description,
                     input_schema: #input_schema,
                     annotations: #annotations,
+                    output_schema: #output_schema,
                 }
             }
         };
@@ -199,6 +205,7 @@ pub fn tool(attr: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
             .or_else(|| fn_item.attrs.iter().fold(None, extract_doc_line)),
         input_schema: input_schema_expr,
         annotations: annotations_expr,
+        output_schema: attribute.output_schema.unwrap_or(none_expr()),
     };
     let tool_attr_fn = resolved_tool_attr.into_fn(tool_attr_fn_ident)?;
     // modify the the input function
