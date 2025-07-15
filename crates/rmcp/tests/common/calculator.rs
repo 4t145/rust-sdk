@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 use rmcp::{
-    ServerHandler,
+    ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_router,
+    schemars, tool, tool_handler, tool_router,
 };
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SumRequest {
@@ -49,8 +49,14 @@ impl Calculator {
     fn sub(&self, Parameters(SubRequest { a, b }): Parameters<SubRequest>) -> String {
         (a - b).to_string()
     }
+
+    #[tool(description = "Always get an error")]
+    fn error_call(&self) -> Result<(), ErrorData> {
+        Err(ErrorData::internal_error("don't panic, this tool always return an error", None))
+    }
 }
 
+#[tool_handler]
 impl ServerHandler for Calculator {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {

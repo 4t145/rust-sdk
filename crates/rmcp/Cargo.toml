@@ -201,3 +201,8 @@ path = "tests/test_message_schema.rs"
 name = "test_progress_subscriber"
 required-features = ["server", "client", "macros"]
 path = "tests/test_progress_subscriber.rs"
+
+[[test]]
+name = "test_tool_call"
+required-features = ["server", "client", "macros"]
+path = "tests/test_tool_call.rs"
